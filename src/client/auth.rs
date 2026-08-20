@@ -201,3 +201,49 @@ where
     .await
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn failure_reason_reads_exact_declared_length() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        server.write_all(&3_u32.to_be_bytes()).await.unwrap();
+        server.write_all(b"badNEXT").await.unwrap();
+
+        let reason = read_security_failure(&mut client, &VncLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(reason, "bad");
+        let mut trailing = [0; 4];
+        client.read_exact(&mut trailing).await.unwrap();
+        assert_eq!(&trailing, b"NEXT");
+    }
+
+    #[tokio::test]
+    async fn failure_reason_rejects_oversized_length_before_allocation() {
+        let limits = VncLimits {
+            max_failure_reason_bytes: 3,
+            ..VncLimits::default()
+        };
+        let mut input = &4_u32.to_be_bytes()[..];
+        let error = read_security_failure(&mut input, &limits)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, VncError::LimitExceeded { .. }));
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_security_type_and_result() {
+        let mut security = &[1_u8, 99][..];
+        let error = SecurityType::read(&mut security, &VncVersion::RFB38, &VncLimits::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, VncError::InvalidSecurityType(99)));
+        assert!(matches!(
+            AuthResult::try_from(7),
+            Err(VncError::InvalidSecurityResult(7))
+        ));
+    }
+}

@@ -22,6 +22,177 @@ fn read_run_length(reader: &mut ZlibReader) -> Result<usize, VncError> {
     Ok(run_length)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::{write::ZlibEncoder, Compression};
+    use std::{
+        future::ready,
+        io::Write,
+        sync::{Arc, Mutex},
+    };
+
+    fn rect(width: u16, height: u16) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }
+    }
+
+    fn compress(data: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).expect("write zlib input");
+        encoder.finish().expect("finish zlib")
+    }
+
+    fn zrle_payload(decoded: &[u8]) -> Vec<u8> {
+        let compressed = compress(decoded);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&compressed);
+        payload
+    }
+
+    async fn decode(payload: Vec<u8>, rect: Rect) -> Result<Vec<VncEvent>, VncError> {
+        let mut decoder = Decoder::new(VncLimits::default());
+        let mut input = std::io::Cursor::new(payload);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        decoder
+            .decode(&PixelFormat::rgba(), &rect, &mut input, &|event| {
+                events.lock().expect("events").push(event);
+                ready(Ok(()))
+            })
+            .await?;
+        let events = events.lock().expect("events").clone();
+        Ok(events)
+    }
+
+    fn raw_payload(events: &[VncEvent]) -> &[u8] {
+        let [VncEvent::RawImage(_, payload)] = events else {
+            panic!("expected exactly one raw image event");
+        };
+        payload
+    }
+
+    #[tokio::test]
+    async fn decodes_true_color_tile() {
+        let decoded = [0, 10, 20, 30, 40, 50, 60];
+        let events = decode(zrle_payload(&decoded), rect(2, 1)).await.unwrap();
+        assert_eq!(raw_payload(&events), &[10, 20, 30, 255, 40, 50, 60, 255]);
+    }
+
+    #[tokio::test]
+    async fn decodes_palette_fill_and_packed_palette() {
+        let decoded = [
+            1,
+            1,
+            2,
+            3, // palette fill
+            2,
+            10,
+            20,
+            30,
+            40,
+            50,
+            60,
+            0b1000_0000, // packed palette
+        ];
+        let events = decode(zrle_payload(&decoded), rect(66, 1)).await.unwrap();
+        let payload = raw_payload(&events);
+        assert_eq!(payload.len(), 66 * 4);
+        assert_eq!(&payload[0..4], &[1, 2, 3, 255]);
+        assert_eq!(&payload[63 * 4..64 * 4], &[1, 2, 3, 255]);
+        assert_eq!(&payload[64 * 4..65 * 4], &[40, 50, 60, 255]);
+        assert_eq!(&payload[65 * 4..66 * 4], &[10, 20, 30, 255]);
+    }
+
+    #[tokio::test]
+    async fn decodes_true_color_and_indexed_rle() {
+        let decoded = [
+            128, 7, 8, 9, 63, // true-color RLE, full 64-pixel tile
+            130, 10, 20, 30, 40, 50, 60, 0x81, 1, // indexed RLE, two pixels of index 1
+        ];
+        let events = decode(zrle_payload(&decoded), rect(66, 1)).await.unwrap();
+        let payload = raw_payload(&events);
+        assert_eq!(payload.len(), 66 * 4);
+        assert!(payload[..64 * 4]
+            .chunks_exact(4)
+            .all(|pixel| pixel == [7, 8, 9, 255]));
+        assert_eq!(
+            &payload[64 * 4..66 * 4],
+            &[40, 50, 60, 255, 40, 50, 60, 255]
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_zrle_payloads() {
+        let too_long_rle = [128, 1, 2, 3, 2];
+        assert!(matches!(
+            decode(zrle_payload(&too_long_rle), rect(2, 1)).await,
+            Err(VncError::InvalidImageData)
+        ));
+
+        let bad_index = [130, 1, 2, 3, 4, 5, 6, 0x02];
+        assert!(matches!(
+            decode(zrle_payload(&bad_index), rect(2, 1)).await,
+            Err(VncError::InvalidImageData)
+        ));
+
+        let mut compressed_with_leftover = compress(&[0, 1, 2, 3]);
+        compressed_with_leftover.push(0);
+        let mut leftover = Vec::new();
+        leftover.extend_from_slice(&(compressed_with_leftover.len() as u32).to_be_bytes());
+        leftover.extend_from_slice(&compressed_with_leftover);
+        assert!(matches!(
+            decode(leftover, rect(1, 1)).await,
+            Err(VncError::IoError(_))
+        ));
+
+        let mut truncated = zrle_payload(&[0, 1, 2]);
+        truncated.pop();
+        assert!(matches!(
+            decode(truncated, rect(1, 1)).await,
+            Err(VncError::IoError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_zrle_encoded_and_decoded_bombs() {
+        let mut limits = VncLimits::default();
+        limits.max_encoded_payload_bytes = 1;
+        let mut decoder = Decoder::new(limits);
+        let payload = zrle_payload(&[0, 1, 2, 3]);
+        let mut input = std::io::Cursor::new(payload);
+        assert!(matches!(
+            decoder
+                .decode(&PixelFormat::rgba(), &rect(1, 1), &mut input, &|_| ready(
+                    Ok(())
+                ))
+                .await,
+            Err(VncError::LimitExceeded {
+                field: "ZRLE encoded payload",
+                ..
+            })
+        ));
+
+        let mut limits = VncLimits::default();
+        limits.max_decoded_payload_bytes = 3;
+        let mut decoder = Decoder::new(limits);
+        let payload = zrle_payload(&[0, 1, 2, 3]);
+        let mut input = std::io::Cursor::new(payload);
+        assert!(matches!(
+            decoder
+                .decode(&PixelFormat::rgba(), &rect(1, 1), &mut input, &|_| ready(
+                    Ok(())
+                ))
+                .await,
+            Err(VncError::LimitExceeded { .. })
+        ));
+    }
+}
+
 fn copy_true_color(
     reader: &mut ZlibReader,
     pixels: &mut Vec<u8>,

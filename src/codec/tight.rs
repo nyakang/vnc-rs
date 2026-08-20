@@ -503,3 +503,227 @@ where
     Ok(len)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::{write::ZlibEncoder, Compression};
+    use image::{codecs::jpeg::JpegEncoder, ColorType, ImageEncoder};
+    use std::{
+        future::ready,
+        io::Write,
+        sync::{Arc, Mutex},
+    };
+
+    fn rect(width: u16, height: u16) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }
+    }
+
+    fn compress(data: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).expect("write zlib input");
+        encoder.finish().expect("finish zlib")
+    }
+
+    fn compact_len(len: usize) -> Vec<u8> {
+        let mut out = vec![(len & 0x7f) as u8];
+        if len > 0x7f {
+            out[0] |= 0x80;
+            out.push(((len >> 7) & 0x7f) as u8);
+            if len > 0x3fff {
+                let last = out.last_mut().expect("second byte");
+                *last |= 0x80;
+                out.push(((len >> 14) & 0xff) as u8);
+            }
+        }
+        out
+    }
+
+    fn encoded_rect(ctrl: u8, body: &[u8]) -> Vec<u8> {
+        let mut payload = vec![ctrl];
+        payload.extend_from_slice(body);
+        payload
+    }
+
+    fn encoded_compressed_rect(ctrl: u8, decoded: &[u8]) -> Vec<u8> {
+        let compressed = compress(decoded);
+        let mut body = compact_len(compressed.len());
+        body.extend_from_slice(&compressed);
+        encoded_rect(ctrl, &body)
+    }
+
+    async fn decode(payload: Vec<u8>, rect: Rect) -> Result<Vec<VncEvent>, VncError> {
+        let mut decoder = Decoder::new(VncLimits::default());
+        let mut input = std::io::Cursor::new(payload);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        decoder
+            .decode(&PixelFormat::rgba(), &rect, &mut input, &|event| {
+                events.lock().expect("events").push(event);
+                ready(Ok(()))
+            })
+            .await?;
+        let events = events.lock().expect("events").clone();
+        Ok(events)
+    }
+
+    fn raw_payload(events: &[VncEvent]) -> &[u8] {
+        let [VncEvent::RawImage(_, payload)] = events else {
+            panic!("expected exactly one raw image event");
+        };
+        payload
+    }
+
+    fn jpeg(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        JpegEncoder::new(&mut out)
+            .write_image(rgb, width, height, ColorType::Rgb8.into())
+            .expect("encode jpeg");
+        out
+    }
+
+    #[tokio::test]
+    async fn decodes_tight_copy_palette_and_gradient() {
+        let copy = decode(encoded_rect(0, &[1, 2, 3, 4, 5, 6]), rect(2, 1))
+            .await
+            .unwrap();
+        assert_eq!(raw_payload(&copy), &[1, 2, 3, 255, 4, 5, 6, 255]);
+
+        let mono = decode(
+            encoded_rect(0x40, &[1, 1, 0, 0, 0, 9, 9, 9, 0b1000_0000]),
+            rect(2, 1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(raw_payload(&mono), &[9, 9, 9, 255, 0, 0, 0, 255]);
+
+        let palette = decode(
+            encoded_rect(0x40, &[1, 2, 0, 0, 0, 1, 2, 3, 9, 9, 9, 2, 1, 0]),
+            rect(3, 1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            raw_payload(&palette),
+            &[9, 9, 9, 255, 1, 2, 3, 255, 0, 0, 0, 255]
+        );
+
+        let gradient = decode(encoded_rect(0x40, &[2, 1, 2, 3]), rect(1, 1))
+            .await
+            .unwrap();
+        assert_eq!(raw_payload(&gradient), &[1, 2, 3, 255]);
+    }
+
+    #[tokio::test]
+    async fn decodes_tight_compressed_streams_and_reset() {
+        let first = decode(
+            encoded_compressed_rect(0, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
+            rect(4, 1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            raw_payload(&first),
+            &[1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255]
+        );
+
+        let mut decoder = Decoder::new(VncLimits::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        for payload in [
+            encoded_compressed_rect(0x00, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
+            encoded_compressed_rect(0x10, &[7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]),
+            encoded_compressed_rect(0x20, &[13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]),
+            encoded_compressed_rect(0x30, &[19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]),
+            encoded_compressed_rect(0x0f, &[25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36]),
+        ] {
+            let mut input = std::io::Cursor::new(payload);
+            decoder
+                .decode(&PixelFormat::rgba(), &rect(4, 1), &mut input, &|event| {
+                    events.lock().expect("events").push(event);
+                    ready(Ok(()))
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(events.lock().expect("events").len(), 5);
+    }
+
+    #[tokio::test]
+    async fn decodes_tight_jpeg_to_raw_image() {
+        let jpeg = jpeg(1, 1, &[200, 10, 20]);
+        let mut body = compact_len(jpeg.len());
+        body.extend_from_slice(&jpeg);
+        let events = decode(encoded_rect(0x90, &body), rect(1, 1)).await.unwrap();
+        assert_eq!(raw_payload(&events).len(), 4);
+        assert!(matches!(events[0], VncEvent::RawImage(_, _)));
+    }
+
+    #[tokio::test]
+    async fn rejects_tight_malformed_inputs() {
+        assert!(matches!(
+            decode(vec![0xf0], rect(1, 1)).await,
+            Err(VncError::InvalidImageData)
+        ));
+        assert!(matches!(
+            decode(
+                encoded_rect(0x40, &[1, 2, 0, 0, 0, 1, 1, 1, 2, 2, 2, 3]),
+                rect(1, 1)
+            )
+            .await,
+            Err(VncError::InvalidImageData)
+        ));
+        assert!(matches!(
+            decode(encoded_rect(0x90, &[0x80, 0x80, 0x80]), rect(1, 1)).await,
+            Err(VncError::InvalidImageData)
+        ));
+        assert!(matches!(
+            decode(encoded_rect(0x90, &[3, 1, 2, 3]), rect(1, 1)).await,
+            Err(VncError::InvalidImageData)
+        ));
+
+        let jpeg = jpeg(2, 1, &[200, 10, 20, 30, 40, 50]);
+        let mut body = compact_len(jpeg.len());
+        body.extend_from_slice(&jpeg);
+        assert!(matches!(
+            decode(encoded_rect(0x90, &body), rect(1, 1)).await,
+            Err(VncError::InvalidImageData)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_tight_encoded_and_decoded_bombs() {
+        let mut limits = VncLimits::default();
+        limits.max_encoded_payload_bytes = 1;
+        let mut decoder = Decoder::new(limits);
+        let payload = encoded_compressed_rect(0, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        let mut input = std::io::Cursor::new(payload);
+        assert!(matches!(
+            decoder
+                .decode(&PixelFormat::rgba(), &rect(4, 1), &mut input, &|_| ready(
+                    Ok(())
+                ))
+                .await,
+            Err(VncError::LimitExceeded {
+                field: "tight encoded payload",
+                ..
+            })
+        ));
+
+        let mut limits = VncLimits::default();
+        limits.max_decoded_payload_bytes = 3;
+        let mut decoder = Decoder::new(limits);
+        let payload = encoded_rect(0, &[1, 2, 3, 4, 5, 6]);
+        let mut input = std::io::Cursor::new(payload);
+        assert!(matches!(
+            decoder
+                .decode(&PixelFormat::rgba(), &rect(2, 1), &mut input, &|_| ready(
+                    Ok(())
+                ))
+                .await,
+            Err(VncError::LimitExceeded { .. })
+        ));
+    }
+}

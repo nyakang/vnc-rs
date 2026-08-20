@@ -376,3 +376,403 @@ where
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Rect, VncEvent};
+    use flate2::{write::ZlibEncoder, Compression};
+    use image::{codecs::jpeg::JpegEncoder, ColorType, ImageEncoder};
+    use std::io::Write;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+    fn connector(
+        stream: DuplexStream,
+    ) -> VncState<DuplexStream, impl Future<Output = Result<String, VncError>> + Send + Sync> {
+        VncConnector::new(stream)
+            .set_auth_method(async { Ok("password".to_owned()) })
+            .add_encoding(VncEncoding::Raw)
+            .build()
+            .unwrap()
+    }
+
+    fn none_connector(
+        stream: DuplexStream,
+    ) -> VncState<DuplexStream, impl Future<Output = Result<String, VncError>> + Send + Sync> {
+        VncConnector::new(stream)
+            .set_auth_method(async { Ok("password".to_owned()) })
+            .set_security_policy(VncSecurityPolicy::NoneOnly)
+            .add_encoding(VncEncoding::Raw)
+            .build()
+            .unwrap()
+    }
+
+    async fn write_server_init(server: &mut DuplexStream) {
+        server.write_all(&2_u16.to_be_bytes()).await.unwrap();
+        server.write_all(&2_u16.to_be_bytes()).await.unwrap();
+        server
+            .write_all(&Vec::<u8>::from(PixelFormat::default()))
+            .await
+            .unwrap();
+        server.write_all(&4_u32.to_be_bytes()).await.unwrap();
+        server.write_all(b"test").await.unwrap();
+        let mut set_encodings = [0; 8];
+        server.read_exact(&mut set_encodings).await.unwrap();
+        assert_eq!(set_encodings, [2, 0, 0, 1, 0, 0, 0, 0]);
+    }
+
+    fn compressed_connector(
+        stream: DuplexStream,
+        policy: VncSecurityPolicy,
+    ) -> VncState<DuplexStream, impl Future<Output = Result<String, VncError>> + Send + Sync> {
+        VncConnector::new(stream)
+            .set_auth_method(async { Ok("password".to_owned()) })
+            .set_security_policy(policy)
+            .set_pixel_format(PixelFormat::rgba())
+            .add_encoding(VncEncoding::Zrle)
+            .add_encoding(VncEncoding::Tight)
+            .add_encoding(VncEncoding::Raw)
+            .build()
+            .unwrap()
+    }
+
+    fn compress(data: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).expect("write zlib input");
+        encoder.finish().expect("finish zlib")
+    }
+
+    fn compact_len(len: usize) -> Vec<u8> {
+        let mut out = vec![(len & 0x7f) as u8];
+        if len > 0x7f {
+            out[0] |= 0x80;
+            out.push(((len >> 7) & 0x7f) as u8);
+            if len > 0x3fff {
+                let last = out.last_mut().expect("second byte");
+                *last |= 0x80;
+                out.push(((len >> 14) & 0xff) as u8);
+            }
+        }
+        out
+    }
+
+    fn zrle_rect_payload(decoded: &[u8]) -> Vec<u8> {
+        let compressed = compress(decoded);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&compressed);
+        payload
+    }
+
+    fn tight_jpeg_rect_payload(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
+        let mut jpeg = Vec::new();
+        JpegEncoder::new(&mut jpeg)
+            .write_image(rgb, width, height, ColorType::Rgb8.into())
+            .expect("encode jpeg");
+        let mut payload = vec![0x90];
+        payload.extend_from_slice(&compact_len(jpeg.len()));
+        payload.extend_from_slice(&jpeg);
+        payload
+    }
+
+    fn framebuffer_update(rect: Rect, encoding: VncEncoding, body: &[u8]) -> Vec<u8> {
+        let mut payload = vec![0, 0];
+        payload.extend_from_slice(&1_u16.to_be_bytes());
+        payload.extend_from_slice(&rect.x.to_be_bytes());
+        payload.extend_from_slice(&rect.y.to_be_bytes());
+        payload.extend_from_slice(&rect.width.to_be_bytes());
+        payload.extend_from_slice(&rect.height.to_be_bytes());
+        payload.extend_from_slice(&(encoding as i32).to_be_bytes());
+        payload.extend_from_slice(body);
+        payload
+    }
+
+    async fn write_scripted_server_init(server: &mut DuplexStream) {
+        server.write_all(&2_u16.to_be_bytes()).await.unwrap();
+        server.write_all(&2_u16.to_be_bytes()).await.unwrap();
+        server
+            .write_all(&Vec::<u8>::from(PixelFormat::default()))
+            .await
+            .unwrap();
+        server.write_all(&8_u32.to_be_bytes()).await.unwrap();
+        server.write_all(b"scripted").await.unwrap();
+
+        let mut set_pixel_format = [0; 20];
+        server.read_exact(&mut set_pixel_format).await.unwrap();
+        assert_eq!(set_pixel_format[0..4], [0, 0, 0, 0]);
+        assert_eq!(
+            &set_pixel_format[4..20],
+            &Vec::<u8>::from(PixelFormat::rgba())
+        );
+
+        let mut header = [0; 4];
+        server.read_exact(&mut header).await.unwrap();
+        assert_eq!(header, [2, 0, 0, 3]);
+        let mut encodings = [0; 12];
+        server.read_exact(&mut encodings).await.unwrap();
+        assert_eq!(
+            encodings,
+            [
+                0, 0, 0, 16, // ZRLE
+                0, 0, 0, 7, // Tight
+                0, 0, 0, 0, // Raw fallback
+            ]
+        );
+
+        let mut request = [0; 10];
+        server.read_exact(&mut request).await.unwrap();
+        assert_eq!(request, [3, 0, 0, 0, 0, 0, 0, 2, 0, 2]);
+    }
+
+    async fn run_scripted_framebuffer(
+        policy: VncSecurityPolicy,
+        encoding: VncEncoding,
+        rect: Rect,
+        body: Vec<u8>,
+    ) -> Vec<u8> {
+        let (client, mut server) = tokio::io::duplex(16 * 1024);
+        let server_task = tokio::spawn(async move {
+            server.write_all(b"RFB 003.008\n").await.unwrap();
+            let mut version = [0; 12];
+            server.read_exact(&mut version).await.unwrap();
+
+            match policy {
+                VncSecurityPolicy::NoneOnly => {
+                    server.write_all(&[1, 1]).await.unwrap();
+                    assert_eq!(server.read_u8().await.unwrap(), 1);
+                    server.write_all(&0_u32.to_be_bytes()).await.unwrap();
+                }
+                VncSecurityPolicy::VncAuthOnly => {
+                    server.write_all(&[1, 2]).await.unwrap();
+                    assert_eq!(server.read_u8().await.unwrap(), 2);
+                    server.write_all(&[3; 16]).await.unwrap();
+                    let mut response = [0; 16];
+                    server.read_exact(&mut response).await.unwrap();
+                    server.write_all(&0_u32.to_be_bytes()).await.unwrap();
+                }
+                VncSecurityPolicy::Auto => unreachable!("scripted tests select a fixed policy"),
+            }
+
+            let _shared = server.read_u8().await.unwrap();
+            write_scripted_server_init(&mut server).await;
+            server
+                .write_all(&framebuffer_update(rect, encoding, &body))
+                .await
+                .unwrap();
+        });
+
+        let state = compressed_connector(client, policy)
+            .try_start()
+            .await
+            .unwrap();
+        let client = state.finish().unwrap();
+        let mut raw = None;
+        for _ in 0..4 {
+            match tokio::time::timeout(std::time::Duration::from_secs(1), client.recv_event())
+                .await
+                .expect("event timeout")
+                .unwrap()
+            {
+                VncEvent::RawImage(_, data) => {
+                    raw = Some(data);
+                    break;
+                }
+                VncEvent::SetResolution(_) => {}
+                event => panic!("unexpected event: {event:?}"),
+            }
+        }
+        client.close().await.unwrap();
+        server_task.await.unwrap();
+        raw.expect("raw image event")
+    }
+
+    async fn run_none_handshake(version: VncVersion) {
+        let (client, mut server) = tokio::io::duplex(1024);
+        let server_task = tokio::spawn(async move {
+            server
+                .write_all(<VncVersion as Into<&[u8; 12]>>::into(version))
+                .await
+                .unwrap();
+            let mut client_version = [0; 12];
+            server.read_exact(&mut client_version).await.unwrap();
+            match version {
+                VncVersion::RFB33 => server.write_all(&1_u32.to_be_bytes()).await.unwrap(),
+                VncVersion::RFB37 | VncVersion::RFB38 => {
+                    server.write_all(&[1, 1]).await.unwrap();
+                    let selected = server.read_u8().await.unwrap();
+                    assert_eq!(selected, 1);
+                    if version == VncVersion::RFB38 {
+                        server.write_all(&0_u32.to_be_bytes()).await.unwrap();
+                    }
+                }
+            }
+            let _shared = server.read_u8().await.unwrap();
+            write_server_init(&mut server).await;
+        });
+
+        let state = none_connector(client).try_start().await.unwrap();
+        let client = state.finish().unwrap();
+        client.close().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn none_security_33_37_38() {
+        run_none_handshake(VncVersion::RFB33).await;
+        run_none_handshake(VncVersion::RFB37).await;
+        run_none_handshake(VncVersion::RFB38).await;
+    }
+
+    #[tokio::test]
+    async fn scripted_rfb_none_decodes_zrle_tight_and_jpeg_as_raw() {
+        let zrle = run_scripted_framebuffer(
+            VncSecurityPolicy::NoneOnly,
+            VncEncoding::Zrle,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 1,
+            },
+            zrle_rect_payload(&[0, 10, 20, 30, 40, 50, 60]),
+        )
+        .await;
+        assert_eq!(zrle, &[10, 20, 30, 255, 40, 50, 60, 255]);
+
+        let tight = run_scripted_framebuffer(
+            VncSecurityPolicy::NoneOnly,
+            VncEncoding::Tight,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 1,
+            },
+            vec![0, 1, 2, 3, 4, 5, 6],
+        )
+        .await;
+        assert_eq!(tight, &[1, 2, 3, 255, 4, 5, 6, 255]);
+
+        let jpeg = run_scripted_framebuffer(
+            VncSecurityPolicy::NoneOnly,
+            VncEncoding::Tight,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            tight_jpeg_rect_payload(1, 1, &[200, 10, 20]),
+        )
+        .await;
+        assert_eq!(jpeg.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn scripted_rfb_vnc_auth_decodes_zrle_tight_and_jpeg_as_raw() {
+        let zrle = run_scripted_framebuffer(
+            VncSecurityPolicy::VncAuthOnly,
+            VncEncoding::Zrle,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 1,
+            },
+            zrle_rect_payload(&[0, 9, 8, 7, 6, 5, 4]),
+        )
+        .await;
+        assert_eq!(zrle, &[9, 8, 7, 255, 6, 5, 4, 255]);
+
+        let tight = run_scripted_framebuffer(
+            VncSecurityPolicy::VncAuthOnly,
+            VncEncoding::Tight,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 1,
+            },
+            vec![0, 6, 5, 4, 3, 2, 1],
+        )
+        .await;
+        assert_eq!(tight, &[6, 5, 4, 255, 3, 2, 1, 255]);
+
+        let jpeg = run_scripted_framebuffer(
+            VncSecurityPolicy::VncAuthOnly,
+            VncEncoding::Tight,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            tight_jpeg_rect_payload(1, 1, &[20, 100, 200]),
+        )
+        .await;
+        assert_eq!(jpeg.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn none_security_38_rejects_unknown_result() {
+        let (client, mut server) = tokio::io::duplex(128);
+        tokio::spawn(async move {
+            server.write_all(b"RFB 003.008\n").await.unwrap();
+            let mut version = [0; 12];
+            server.read_exact(&mut version).await.unwrap();
+            server.write_all(&[1, 1]).await.unwrap();
+            assert_eq!(server.read_u8().await.unwrap(), 1);
+            server.write_all(&7_u32.to_be_bytes()).await.unwrap();
+        });
+        let error = none_connector(client).try_start().await.err().unwrap();
+        assert!(matches!(error, VncError::InvalidSecurityResult(7)));
+    }
+
+    #[tokio::test]
+    async fn vnc_auth_38_success() {
+        let (client, mut server) = tokio::io::duplex(1024);
+        let server_task = tokio::spawn(async move {
+            server.write_all(b"RFB 003.008\n").await.unwrap();
+            let mut version = [0; 12];
+            server.read_exact(&mut version).await.unwrap();
+            server.write_all(&[1, 2]).await.unwrap();
+            assert_eq!(server.read_u8().await.unwrap(), 2);
+            server.write_all(&[3; 16]).await.unwrap();
+            let mut response = [0; 16];
+            server.read_exact(&mut response).await.unwrap();
+            server.write_all(&0_u32.to_be_bytes()).await.unwrap();
+            let _shared = server.read_u8().await.unwrap();
+            write_server_init(&mut server).await;
+        });
+        let state = connector(client).try_start().await.unwrap();
+        state.finish().unwrap().close().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn required_security_policy_is_fail_closed() {
+        let (client, mut server) = tokio::io::duplex(128);
+        tokio::spawn(async move {
+            server.write_all(b"RFB 003.008\n").await.unwrap();
+            let mut version = [0; 12];
+            server.read_exact(&mut version).await.unwrap();
+            server.write_all(&[1, 1]).await.unwrap();
+        });
+
+        let result = VncConnector::new(client)
+            .set_auth_method(async { Ok("password".to_owned()) })
+            .set_security_policy(VncSecurityPolicy::VncAuthOnly)
+            .add_encoding(VncEncoding::Raw)
+            .build()
+            .unwrap()
+            .try_start()
+            .await;
+        let Err(error) = result else {
+            panic!("required VNC auth policy must fail when the server only offers None");
+        };
+
+        assert!(matches!(
+            error,
+            VncError::RequiredSecurityTypeUnavailable("vnc-auth")
+        ));
+    }
+}

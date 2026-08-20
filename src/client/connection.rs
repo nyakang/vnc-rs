@@ -595,3 +595,46 @@ where
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unknown_encoding_and_coordinate_overflow() {
+        let mut wire = [0_u8; 12];
+        wire[4..6].copy_from_slice(&1_u16.to_be_bytes());
+        wire[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        wire[8..12].copy_from_slice(&99_i32.to_be_bytes());
+        assert!(matches!(
+            ImageRect::try_from(wire),
+            Err(VncError::InvalidEncoding(99))
+        ));
+
+        let limits = VncLimits::default();
+        let overflowing = Rect {
+            x: u16::MAX,
+            y: 0,
+            width: 2,
+            height: 1,
+        };
+        assert!(matches!(
+            validate_rect(&overflowing, &limits),
+            Err(VncError::InvalidDimensions)
+        ));
+    }
+
+    #[test]
+    fn rejects_oversized_framebuffer_and_pixel_product() {
+        let limits = VncLimits {
+            max_framebuffer_width: 100,
+            max_framebuffer_height: 100,
+            max_framebuffer_pixels: 50,
+            ..VncLimits::default()
+        };
+        assert!(validate_framebuffer(101, 1, &limits).is_err());
+        assert!(matches!(
+            validate_framebuffer(10, 10, &limits),
+            Err(VncError::LimitExceeded { .. })
+        ));
+    }
+}
