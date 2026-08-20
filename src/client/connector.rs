@@ -9,6 +9,13 @@ use tracing::{info, trace};
 
 use crate::{PixelFormat, VncEncoding, VncError, VncLimits, VncVersion};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VncSecurityPolicy {
+    Auto,
+    NoneOnly,
+    VncAuthOnly,
+}
+
 pub enum VncState<S, F>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
@@ -57,9 +64,24 @@ where
                     )
                     .await?;
 
-                    if connector.auth_methond.is_none()
-                        && security_types.contains(&SecurityType::None)
+                    if connector.security_policy == VncSecurityPolicy::NoneOnly
+                        && !security_types.contains(&SecurityType::None)
                     {
+                        return Err(VncError::RequiredSecurityTypeUnavailable("none"));
+                    }
+                    if connector.security_policy == VncSecurityPolicy::VncAuthOnly
+                        && !security_types.contains(&SecurityType::VncAuth)
+                    {
+                        return Err(VncError::RequiredSecurityTypeUnavailable("vnc-auth"));
+                    }
+
+                    let prefer_none = match connector.security_policy {
+                        VncSecurityPolicy::Auto => connector.auth_methond.is_none(),
+                        VncSecurityPolicy::NoneOnly => true,
+                        VncSecurityPolicy::VncAuthOnly => false,
+                    };
+
+                    if prefer_none && security_types.contains(&SecurityType::None) {
                         match connector.rfb_version {
                             VncVersion::RFB33 => {
                                 // If the security-type is 1, for no authentication, the server does not
@@ -179,6 +201,7 @@ where
 {
     stream: S,
     auth_methond: Option<F>,
+    security_policy: VncSecurityPolicy,
     rfb_version: VncVersion,
     allow_shared: bool,
     pixel_format: Option<PixelFormat>,
@@ -222,6 +245,7 @@ where
         Self {
             stream,
             auth_methond: None,
+            security_policy: VncSecurityPolicy::Auto,
             allow_shared: true,
             rfb_version: VncVersion::RFB38,
             pixel_format: None,
@@ -271,6 +295,11 @@ where
     ///
     pub fn set_auth_method(mut self, auth_callback: F) -> Self {
         self.auth_methond = Some(auth_callback);
+        self
+    }
+
+    pub fn set_security_policy(mut self, policy: VncSecurityPolicy) -> Self {
+        self.security_policy = policy;
         self
     }
 

@@ -5,4 +5,4 @@ mod messages;
 mod security;
 
 pub use connection::VncClient;
-pub use connector::VncConnector;
+pub use connector::{VncConnector, VncSecurityPolicy};
