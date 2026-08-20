@@ -1,5 +1,7 @@
 use crate::{PixelFormat, Rect, VncError, VncEvent, VncLimits};
+use image::{GenericImageView, ImageReader, Limits as ImageLimits};
 use std::future::Future;
+use std::io::Cursor;
 use std::io::Read;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::error;
@@ -134,7 +136,7 @@ impl Decoder {
 
     async fn jpeg_rect<S, F, Fut>(
         &mut self,
-        _format: &PixelFormat,
+        format: &PixelFormat,
         rect: &Rect,
         input: &mut S,
         output_func: &F,
@@ -144,8 +146,29 @@ impl Decoder {
         F: Fn(VncEvent) -> Fut,
         Fut: Future<Output = Result<(), VncError>>,
     {
+        let output_size = checked_rgba_size(rect, &self.limits)?;
         let data = self.read_data(input).await?;
-        output_func(VncEvent::JpegImage(*rect, data)).await?;
+        let mut reader = ImageReader::new(Cursor::new(data))
+            .with_guessed_format()
+            .map_err(|_| VncError::InvalidImageData)?;
+        let mut image_limits = ImageLimits::default();
+        image_limits.max_image_width = Some(u32::from(rect.width));
+        image_limits.max_image_height = Some(u32::from(rect.height));
+        image_limits.max_alloc = Some(output_size as u64);
+        reader.limits(image_limits);
+        let image = reader.decode().map_err(|_| VncError::InvalidImageData)?;
+        if image.dimensions() != (u32::from(rect.width), u32::from(rect.height)) {
+            return Err(VncError::InvalidImageData);
+        }
+
+        let mut rgba = Vec::with_capacity(output_size);
+        for pixel in image.to_rgb8().pixels() {
+            rgba.extend_from_slice(&self.to_true_color(format, &pixel.0));
+        }
+        if rgba.len() != output_size {
+            return Err(VncError::InvalidImageData);
+        }
+        output_func(VncEvent::RawImage(*rect, rgba)).await?;
         Ok(())
     }
 
