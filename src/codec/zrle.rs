@@ -4,7 +4,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::error;
 
 use super::{
-    checked_pixel_count, ensure_payload_limit, uninit_vec, zlib::ZlibReader,
+    checked_buffer_size, checked_pixel_count, ensure_payload_limit, uninit_vec, zlib::ZlibReader,
 };
 
 fn read_run_length(reader: &mut ZlibReader) -> Result<usize, VncError> {
@@ -92,6 +92,7 @@ impl Decoder {
         let mut reader = ZlibReader::new(decompressor, &zlib_data);
 
         let bpp = format.bits_per_pixel as usize / 8;
+        let rect_bytes = checked_buffer_size(rect, bpp, &self.limits)?;
         let pixel_mask = ((format.red_max as u32) << format.red_shift)
             | ((format.green_max as u32) << format.green_shift)
             | ((format.blue_max as u32) << format.blue_shift);
@@ -117,6 +118,7 @@ impl Decoder {
                 (bpp, false)
             };
         let mut palette = Vec::with_capacity(128 * bpp);
+        let mut rect_pixels = vec![0_u8; rect_bytes];
 
         let mut y = 0;
         while y < rect.height {
@@ -265,14 +267,70 @@ impl Decoder {
                 if pixels.len() != tile_bytes {
                     return Err(VncError::InvalidImageData);
                 }
-                output_func(VncEvent::RawImage(tile_rect, pixels)).await?;
+                copy_tile_to_rect(&mut rect_pixels, rect, &tile_rect, &pixels, bpp)?;
                 x += width;
             }
             y += height;
         }
 
         self.decompressor = Some(reader.into_inner()?);
+        output_func(VncEvent::RawImage(*rect, rect_pixels)).await?;
 
         Ok(())
     }
+}
+
+fn copy_tile_to_rect(
+    rect_pixels: &mut [u8],
+    rect: &Rect,
+    tile_rect: &Rect,
+    tile_pixels: &[u8],
+    bpp: usize,
+) -> Result<(), VncError> {
+    let tile_row_bytes = usize::from(tile_rect.width)
+        .checked_mul(bpp)
+        .ok_or(VncError::IntegerOverflow("ZRLE tile row bytes"))?;
+    let rect_row_bytes = usize::from(rect.width)
+        .checked_mul(bpp)
+        .ok_or(VncError::IntegerOverflow("ZRLE rect row bytes"))?;
+    let x_offset = usize::from(
+        tile_rect
+            .x
+            .checked_sub(rect.x)
+            .ok_or(VncError::InvalidImageData)?,
+    )
+    .checked_mul(bpp)
+    .ok_or(VncError::IntegerOverflow("ZRLE tile x offset"))?;
+    let y_offset = usize::from(
+        tile_rect
+            .y
+            .checked_sub(rect.y)
+            .ok_or(VncError::InvalidImageData)?,
+    );
+
+    for row in 0..usize::from(tile_rect.height) {
+        let src_start = row
+            .checked_mul(tile_row_bytes)
+            .ok_or(VncError::IntegerOverflow("ZRLE tile source row"))?;
+        let src_end = src_start
+            .checked_add(tile_row_bytes)
+            .ok_or(VncError::IntegerOverflow("ZRLE tile source end"))?;
+        let dst_start = y_offset
+            .checked_add(row)
+            .and_then(|y| y.checked_mul(rect_row_bytes))
+            .and_then(|start| start.checked_add(x_offset))
+            .ok_or(VncError::IntegerOverflow("ZRLE rect destination row"))?;
+        let dst_end = dst_start
+            .checked_add(tile_row_bytes)
+            .ok_or(VncError::IntegerOverflow("ZRLE rect destination end"))?;
+        let src = tile_pixels
+            .get(src_start..src_end)
+            .ok_or(VncError::InvalidImageData)?;
+        let dst = rect_pixels
+            .get_mut(dst_start..dst_end)
+            .ok_or(VncError::InvalidImageData)?;
+        dst.copy_from_slice(src);
+    }
+
+    Ok(())
 }
