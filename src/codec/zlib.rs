@@ -71,10 +71,7 @@ impl Read for ZlibReader<'_> {
             Ok(flate2::Status::Ok) => Ok(produced),
             Ok(flate2::Status::BufError) => Ok(0),
             Err(error) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
-            Ok(flate2::Status::StreamEnd) => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "zlib stream end",
-            )),
+            Ok(flate2::Status::StreamEnd) => Ok(produced),
         }
     }
 }

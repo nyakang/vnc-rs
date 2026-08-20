@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! # VNC-RS
 //!
 //! ## Description

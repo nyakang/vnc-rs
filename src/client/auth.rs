@@ -1,5 +1,5 @@
 use super::security;
-use crate::{VncError, VncVersion};
+use crate::{VncError, VncLimits, VncVersion};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[allow(dead_code)]
@@ -22,12 +22,22 @@ pub(super) enum SecurityType {
 
 impl TryFrom<u8> for SecurityType {
     type Error = VncError;
+
     fn try_from(num: u8) -> Result<Self, Self::Error> {
         match num {
-            0 | 1 | 2 | 5 | 6 | 16 | 17 | 18 | 19 | 20 | 21 | 22 => {
-                Ok(unsafe { std::mem::transmute::<u8, SecurityType>(num) })
-            }
-            invalid => Err(VncError::InvalidSecurityTyep(invalid)),
+            0 => Ok(Self::Invalid),
+            1 => Ok(Self::None),
+            2 => Ok(Self::VncAuth),
+            5 => Ok(Self::RA2),
+            6 => Ok(Self::RA2ne),
+            16 => Ok(Self::Tight),
+            17 => Ok(Self::Ultra),
+            18 => Ok(Self::Tls),
+            19 => Ok(Self::VeNCrypt),
+            20 => Ok(Self::GtkVncSasl),
+            21 => Ok(Self::Md5Hash),
+            22 => Ok(Self::ColinDeanXvp),
+            invalid => Err(VncError::InvalidSecurityType(u32::from(invalid))),
         }
     }
 }
@@ -38,40 +48,65 @@ impl From<SecurityType> for u8 {
     }
 }
 
+async fn read_bounded_string<S>(
+    reader: &mut S,
+    field: &'static str,
+    limit: usize,
+) -> Result<String, VncError>
+where
+    S: AsyncRead + Unpin,
+{
+    let len = reader.read_u32().await? as usize;
+    if len > limit {
+        return Err(VncError::LimitExceeded {
+            field,
+            actual: len as u64,
+            limit: limit as u64,
+        });
+    }
+    let mut bytes = vec![0; len];
+    reader.read_exact(&mut bytes).await?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 impl SecurityType {
-    pub(super) async fn read<S>(reader: &mut S, version: &VncVersion) -> Result<Vec<Self>, VncError>
+    pub(super) async fn read<S>(
+        reader: &mut S,
+        version: &VncVersion,
+        limits: &VncLimits,
+    ) -> Result<Vec<Self>, VncError>
     where
         S: AsyncRead + Unpin,
     {
         match version {
             VncVersion::RFB33 => {
-                let security_type = reader.read_u32().await?;
-                let security_type = (security_type as u8).try_into()?;
-                if let SecurityType::Invalid = security_type {
-                    let _ = reader.read_u32().await?;
-                    let mut err_msg = String::new();
-                    reader.read_to_string(&mut err_msg).await?;
-                    return Err(VncError::General(err_msg));
+                let raw = reader.read_u32().await?;
+                let security_type = u8::try_from(raw)
+                    .map_err(|_| VncError::InvalidSecurityType(raw))?
+                    .try_into()?;
+                if security_type == SecurityType::Invalid {
+                    let reason = read_bounded_string(
+                        reader,
+                        "security failure reason",
+                        limits.max_failure_reason_bytes,
+                    )
+                    .await?;
+                    return Err(VncError::SecurityFailure(reason));
                 }
                 Ok(vec![security_type])
             }
-            _ => {
-                // +--------------------------+-------------+--------------------------+
-                // | No. of bytes             | Type        | Description              |
-                // |                          | [Value]     |                          |
-                // +--------------------------+-------------+--------------------------+
-                // | 1                        | U8          | number-of-security-types |
-                // | number-of-security-types | U8 array    | security-types           |
-                // +--------------------------+-------------+--------------------------+
+            VncVersion::RFB37 | VncVersion::RFB38 => {
                 let num = reader.read_u8().await?;
-
                 if num == 0 {
-                    let _ = reader.read_u32().await?;
-                    let mut err_msg = String::new();
-                    reader.read_to_string(&mut err_msg).await?;
-                    return Err(VncError::General(err_msg));
+                    let reason = read_bounded_string(
+                        reader,
+                        "security failure reason",
+                        limits.max_failure_reason_bytes,
+                    )
+                    .await?;
+                    return Err(VncError::SecurityFailure(reason));
                 }
-                let mut sec_types = vec![];
+                let mut sec_types = Vec::with_capacity(num as usize);
                 for _ in 0..num {
                     sec_types.push(reader.read_u8().await?.try_into()?);
                 }
@@ -90,22 +125,21 @@ impl SecurityType {
     }
 }
 
-#[allow(dead_code)]
-#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AuthResult {
-    Ok = 0,
-    Failed = 1,
+    Ok,
+    Failed,
 }
 
-impl From<u32> for AuthResult {
-    fn from(num: u32) -> Self {
-        unsafe { std::mem::transmute(num) }
-    }
-}
+impl TryFrom<u32> for AuthResult {
+    type Error = VncError;
 
-impl From<AuthResult> for u32 {
-    fn from(e: AuthResult) -> Self {
-        e as u32
+    fn try_from(num: u32) -> Result<Self, Self::Error> {
+        match num {
+            0 => Ok(Self::Ok),
+            1 => Ok(Self::Failed),
+            invalid => Err(VncError::InvalidSecurityResult(invalid)),
+        }
     }
 }
 
@@ -122,17 +156,12 @@ impl AuthHelper {
         let mut challenge = [0; 16];
         reader.read_exact(&mut challenge).await?;
 
-        let credential_len = credential.len();
         let mut key = [0u8; 8];
         for (i, key_i) in key.iter_mut().enumerate() {
-            let c = if i < credential_len {
-                credential.as_bytes()[i]
-            } else {
-                0
-            };
+            let c = credential.as_bytes().get(i).copied().unwrap_or(0);
             let mut cs = 0u8;
             for j in 0..8 {
-                cs |= ((c >> j) & 1) << (7 - j)
+                cs |= ((c >> j) & 1) << (7 - j);
             }
             *key_i = cs;
         }
@@ -153,7 +182,22 @@ impl AuthHelper {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        let result = reader.read_u32().await?;
-        Ok(result.into())
+        reader.read_u32().await?.try_into()
     }
 }
+
+pub(super) async fn read_security_failure<S>(
+    reader: &mut S,
+    limits: &VncLimits,
+) -> Result<String, VncError>
+where
+    S: AsyncRead + Unpin,
+{
+    read_bounded_string(
+        reader,
+        "security failure reason",
+        limits.max_failure_reason_bytes,
+    )
+    .await
+}
+

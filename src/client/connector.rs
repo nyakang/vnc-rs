@@ -1,5 +1,5 @@
 use super::{
-    auth::{AuthHelper, AuthResult, SecurityType},
+    auth::{read_security_failure, AuthHelper, AuthResult, SecurityType},
     connection::VncClient,
 };
 use std::future::Future;
@@ -7,7 +7,7 @@ use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tracing::{info, trace};
 
-use crate::{PixelFormat, VncEncoding, VncError, VncVersion};
+use crate::{PixelFormat, VncEncoding, VncError, VncLimits, VncVersion};
 
 pub enum VncState<S, F>
 where
@@ -50,12 +50,16 @@ where
                     Ok(VncState::Authenticate(connector).try_start().await?)
                 }
                 VncState::Authenticate(mut connector) => {
-                    let security_types =
-                        SecurityType::read(&mut connector.stream, &connector.rfb_version).await?;
+                    let security_types = SecurityType::read(
+                        &mut connector.stream,
+                        &connector.rfb_version,
+                        &connector.limits,
+                    )
+                    .await?;
 
-                    assert!(!security_types.is_empty());
-
-                    if security_types.contains(&SecurityType::None) {
+                    if connector.auth_methond.is_none()
+                        && security_types.contains(&SecurityType::None)
+                    {
                         match connector.rfb_version {
                             VncVersion::RFB33 => {
                                 // If the security-type is 1, for no authentication, the server does not
@@ -75,8 +79,16 @@ where
                                 info!("No auth needed in vnc3.8");
                                 SecurityType::write(&SecurityType::None, &mut connector.stream)
                                     .await?;
-                                let mut ok = [0; 4];
-                                connector.stream.read_exact(&mut ok).await?;
+                                let result: AuthResult =
+                                    connector.stream.read_u32().await?.try_into()?;
+                                if result == AuthResult::Failed {
+                                    let reason = read_security_failure(
+                                        &mut connector.stream,
+                                        &connector.limits,
+                                    )
+                                    .await?;
+                                    return Err(VncError::SecurityFailure(reason));
+                                }
                             }
                         }
                     } else {
@@ -100,8 +112,7 @@ where
                                     .await?;
                             }
                         } else {
-                            let msg = "Security type apart from Vnc Auth has not been implemented";
-                            return Err(VncError::General(msg.to_owned()));
+                            return Err(VncError::UnsupportedSecurityType);
                         }
 
                         // get password
@@ -109,7 +120,11 @@ where
                             return Err(VncError::NoPassword);
                         }
 
-                        let credential = (connector.auth_methond.take().unwrap()).await?;
+                        let credential = connector
+                            .auth_methond
+                            .take()
+                            .ok_or(VncError::NoPassword)?
+                            .await?;
 
                         // auth
                         let auth = AuthHelper::read(&mut connector.stream, &credential).await?;
@@ -122,10 +137,10 @@ where
                                 // error message before closing the connection.
                                 return Err(VncError::WrongPassword);
                             } else {
-                                let _ = connector.stream.read_u32().await?;
-                                let mut err_msg = String::new();
-                                connector.stream.read_to_string(&mut err_msg).await?;
-                                return Err(VncError::General(err_msg));
+                                let reason =
+                                    read_security_failure(&mut connector.stream, &connector.limits)
+                                        .await?;
+                                return Err(VncError::SecurityFailure(reason));
                             }
                         }
                     }
@@ -137,11 +152,12 @@ where
                             connector.allow_shared,
                             connector.pixel_format,
                             connector.encodings,
+                            connector.limits,
                         )
                         .await?,
                     ))
                 }
-                _ => unreachable!(),
+                VncState::Connected(_) => Err(VncError::ConnectError),
             }
         })
     }
@@ -167,6 +183,7 @@ where
     allow_shared: bool,
     pixel_format: Option<PixelFormat>,
     encodings: Vec<VncEncoding>,
+    limits: VncLimits,
 }
 
 impl<S, F> VncConnector<S, F>
@@ -209,6 +226,7 @@ where
             rfb_version: VncVersion::RFB38,
             pixel_format: None,
             encodings: Vec::new(),
+            limits: VncLimits::default(),
         }
     }
 
@@ -308,12 +326,24 @@ where
         self
     }
 
+    /// Set resource limits for server-controlled protocol fields and buffers.
+    pub fn set_limits(mut self, limits: VncLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
     /// Complete the client configuration
     ///
     pub fn build(self) -> Result<VncState<S, F>, VncError> {
         if self.encodings.is_empty() {
             return Err(VncError::NoEncoding);
         }
+        if self.limits.channel_capacity == 0 {
+            return Err(VncError::General(
+                "channel capacity must be greater than zero".to_owned(),
+            ));
+        }
         Ok(VncState::Handshake(self))
     }
 }
+

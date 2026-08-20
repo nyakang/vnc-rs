@@ -1,4 +1,4 @@
-use crate::{PixelFormat, Rect, VncEncoding, VncError};
+use crate::{PixelFormat, Rect, VncEncoding, VncError, VncLimits};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[derive(Debug)]
@@ -31,6 +31,12 @@ impl ClientMsg {
                 Ok(())
             }
             ClientMsg::SetEncodings(encodings) => {
+                let count =
+                    u16::try_from(encodings.len()).map_err(|_| VncError::LimitExceeded {
+                        field: "client encodings",
+                        actual: encodings.len() as u64,
+                        limit: u64::from(u16::MAX),
+                    })?;
                 //  +--------------+--------------+---------------------+
                 // | No. of bytes | Type [Value] | Description         |
                 // +--------------+--------------+---------------------+
@@ -46,7 +52,7 @@ impl ClientMsg {
                 // | 4            | S32          | encoding-type |
                 // +--------------+--------------+---------------+
                 let mut payload = vec![2, 0];
-                payload.extend_from_slice(&(encodings.len() as u16).to_be_bytes());
+                payload.extend_from_slice(&count.to_be_bytes());
                 for e in encodings {
                     payload.write_u32(e.into()).await?;
                 }
@@ -102,6 +108,11 @@ impl ClientMsg {
                 Ok(())
             }
             ClientMsg::ClientCutText(s) => {
+                let length = u32::try_from(s.len()).map_err(|_| VncError::LimitExceeded {
+                    field: "client clipboard",
+                    actual: s.len() as u64,
+                    limit: u64::from(u32::MAX),
+                })?;
                 //   +--------------+--------------+--------------+
                 //   | No. of bytes | Type [Value] | Description  |
                 //   +--------------+--------------+--------------+
@@ -111,7 +122,7 @@ impl ClientMsg {
                 //   | length       | U8 array     | text         |
                 //   +--------------+--------------+--------------+
                 let mut payload = vec![6_u8, 0, 0, 0];
-                payload.write_u32(s.len() as u32).await?;
+                payload.write_u32(length).await?;
                 payload.write_all(s.as_bytes()).await?;
                 writer.write_all(&payload).await?;
                 Ok(())
@@ -129,7 +140,7 @@ pub(super) enum ServerMsg {
 }
 
 impl ServerMsg {
-    pub(super) async fn read<S>(reader: &mut S) -> Result<Self, VncError>
+    pub(super) async fn read<S>(reader: &mut S, limits: &VncLimits) -> Result<Self, VncError>
     where
         S: AsyncRead + Unpin,
     {
@@ -159,7 +170,7 @@ impl ServerMsg {
                 // | 2            | U16          | first-color      |
                 // | 2            | U16          | number-of-colors |
                 // +--------------+--------------+------------------+
-                unimplemented!()
+                Err(VncError::WrongServerMessage)
             }
             2 => {
                 // Bell
@@ -182,8 +193,15 @@ impl ServerMsg {
                 // +--------------+--------------+--------------+
                 let mut padding = [0; 3];
                 reader.read_exact(&mut padding).await?;
-                let len = reader.read_u32().await?;
-                let mut buffer_str = vec![0; len as usize];
+                let len = reader.read_u32().await? as usize;
+                if len > limits.max_clipboard_bytes {
+                    return Err(VncError::LimitExceeded {
+                        field: "server clipboard",
+                        actual: len as u64,
+                        limit: limits.max_clipboard_bytes as u64,
+                    });
+                }
+                let mut buffer_str = vec![0; len];
                 reader.read_exact(&mut buffer_str).await?;
                 Ok(Self::ServerCutText(
                     String::from_utf8_lossy(&buffer_str).to_string(),

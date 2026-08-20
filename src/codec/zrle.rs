@@ -1,16 +1,20 @@
-use crate::{PixelFormat, Rect, VncError, VncEvent};
+use crate::{PixelFormat, Rect, VncError, VncEvent, VncLimits};
 use std::future::Future;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::error;
 
-use super::{uninit_vec, zlib::ZlibReader};
+use super::{
+    checked_pixel_count, ensure_payload_limit, uninit_vec, zlib::ZlibReader,
+};
 
 fn read_run_length(reader: &mut ZlibReader) -> Result<usize, VncError> {
     let mut run_length_part;
-    let mut run_length = 1;
+    let mut run_length = 1_usize;
     loop {
         run_length_part = reader.read_u8()?;
-        run_length += run_length_part as usize;
+        run_length = run_length
+            .checked_add(usize::from(run_length_part))
+            .ok_or(VncError::IntegerOverflow("ZRLE run length"))?;
         if 255 != run_length_part {
             break;
         }
@@ -34,19 +38,33 @@ fn copy_true_color(
     Ok(())
 }
 
-fn copy_indexed(palette: &[u8], pixels: &mut Vec<u8>, bpp: usize, index: u8) {
-    let start = index as usize * bpp;
-    pixels.extend_from_slice(&palette[start..start + bpp])
+fn copy_indexed(
+    palette: &[u8],
+    pixels: &mut Vec<u8>,
+    bpp: usize,
+    index: u8,
+) -> Result<(), VncError> {
+    let start = usize::from(index)
+        .checked_mul(bpp)
+        .ok_or(VncError::IntegerOverflow("ZRLE palette offset"))?;
+    let end = start
+        .checked_add(bpp)
+        .ok_or(VncError::IntegerOverflow("ZRLE palette end"))?;
+    let color = palette.get(start..end).ok_or(VncError::InvalidImageData)?;
+    pixels.extend_from_slice(color);
+    Ok(())
 }
 
 pub struct Decoder {
     decompressor: Option<flate2::Decompress>,
+    limits: VncLimits,
 }
 
 impl Decoder {
-    pub fn new() -> Self {
+    pub fn new(limits: VncLimits) -> Self {
         Self {
             decompressor: Some(flate2::Decompress::new(true)),
+            limits,
         }
     }
 
@@ -63,9 +81,14 @@ impl Decoder {
         Fut: Future<Output = Result<(), VncError>>,
     {
         let data_len = input.read_u32().await? as usize;
+        ensure_payload_limit(
+            "ZRLE encoded payload",
+            data_len,
+            self.limits.max_encoded_payload_bytes,
+        )?;
         let mut zlib_data = uninit_vec(data_len);
         input.read_exact(&mut zlib_data).await?;
-        let decompressor = self.decompressor.take().unwrap();
+        let decompressor = self.decompressor.take().ok_or(VncError::InvalidImageData)?;
         let mut reader = ZlibReader::new(decompressor, &zlib_data);
 
         let bpp = format.bits_per_pixel as usize / 8;
@@ -109,7 +132,21 @@ impl Decoder {
                 } else {
                     64
                 };
-                let pixel_count = height as usize * width as usize;
+                let tile_rect = Rect {
+                    x: rect.x + x,
+                    y: rect.y + y,
+                    width,
+                    height,
+                };
+                let pixel_count = checked_pixel_count(&tile_rect)?;
+                let tile_bytes = pixel_count
+                    .checked_mul(bpp)
+                    .ok_or(VncError::IntegerOverflow("ZRLE tile bytes"))?;
+                ensure_payload_limit(
+                    "ZRLE tile payload",
+                    tile_bytes,
+                    self.limits.max_decoded_payload_bytes,
+                )?;
 
                 let control = reader.read_u8()?;
                 let is_rle = control & 0x80 > 0;
@@ -126,7 +163,7 @@ impl Decoder {
                     )?
                 }
 
-                let mut pixels = Vec::with_capacity(pixel_count * bpp);
+                let mut pixels = Vec::with_capacity(tile_bytes);
                 match (is_rle, palette_size) {
                     (false, 0) => {
                         // True Color pixels
@@ -143,7 +180,7 @@ impl Decoder {
                     (false, 1) => {
                         // Color fill
                         for _ in 0..pixel_count {
-                            copy_indexed(&palette, &mut pixels, bpp, 0)
+                            copy_indexed(&palette, &mut pixels, bpp, 0)?
                         }
                     }
                     (false, 2..=16) => {
@@ -152,7 +189,7 @@ impl Decoder {
                             2 => 1,
                             3..=4 => 2,
                             5..=16 => 4,
-                            _ => unreachable!(),
+                            _ => return Err(VncError::InvalidImageData),
                         };
                         let mut encoded = reader.read_u8()?;
                         let mask = (1 << bits_per_index) - 1;
@@ -166,7 +203,7 @@ impl Decoder {
                                 }
                                 let idx = (encoded >> shift) & mask;
 
-                                copy_indexed(&palette, &mut pixels, bpp, idx);
+                                copy_indexed(&palette, &mut pixels, bpp, idx)?;
                                 shift -= bits_per_index;
                             }
                             if shift < 8 - bits_per_index && y < height - 1 {
@@ -188,6 +225,9 @@ impl Decoder {
                                 bpp,
                             )?;
                             let run_length = read_run_length(&mut reader)?;
+                            if run_length > pixel_count - count {
+                                return Err(VncError::InvalidImageData);
+                            }
                             for _ in 0..run_length {
                                 pixels.extend(&pixel)
                             }
@@ -206,8 +246,13 @@ impl Decoder {
                             } else {
                                 1
                             };
+                            if usize::from(index) >= usize::from(palette_size)
+                                || run_length > pixel_count - count
+                            {
+                                return Err(VncError::InvalidImageData);
+                            }
                             for _ in 0..run_length {
-                                copy_indexed(&palette, &mut pixels, bpp, index);
+                                copy_indexed(&palette, &mut pixels, bpp, index)?;
                             }
                             count += run_length;
                         }
@@ -217,16 +262,10 @@ impl Decoder {
                         return Err(VncError::InvalidImageData);
                     }
                 }
-                output_func(VncEvent::RawImage(
-                    Rect {
-                        x: rect.x + x,
-                        y: rect.y + y,
-                        width,
-                        height,
-                    },
-                    pixels,
-                ))
-                .await?;
+                if pixels.len() != tile_bytes {
+                    return Err(VncError::InvalidImageData);
+                }
+                output_func(VncEvent::RawImage(tile_rect, pixels)).await?;
                 x += width;
             }
             y += height;

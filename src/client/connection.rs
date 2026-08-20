@@ -16,8 +16,8 @@ use tokio::{
 use tokio_util::compat::*;
 use tracing::*;
 
-use crate::{codec, PixelFormat, Rect, VncEncoding, VncError, VncEvent, X11Event};
-const CHANNEL_SIZE: usize = 4096;
+use crate::{codec, PixelFormat, Rect, VncEncoding, VncError, VncEvent, VncLimits, X11Event};
+const NETWORK_CHUNK_SIZE: usize = 64 * 1024;
 
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::spawn;
@@ -31,21 +31,21 @@ struct ImageRect {
     encoding: VncEncoding,
 }
 
-impl From<[u8; 12]> for ImageRect {
-    fn from(buf: [u8; 12]) -> Self {
-        Self {
+impl TryFrom<[u8; 12]> for ImageRect {
+    type Error = VncError;
+
+    fn try_from(buf: [u8; 12]) -> Result<Self, Self::Error> {
+        Ok(Self {
             rect: Rect {
-                x: ((buf[0] as u16) << 8) | buf[1] as u16,
-                y: ((buf[2] as u16) << 8) | buf[3] as u16,
-                width: ((buf[4] as u16) << 8) | buf[5] as u16,
-                height: ((buf[6] as u16) << 8) | buf[7] as u16,
+                x: u16::from_be_bytes([buf[0], buf[1]]),
+                y: u16::from_be_bytes([buf[2], buf[3]]),
+                width: u16::from_be_bytes([buf[4], buf[5]]),
+                height: u16::from_be_bytes([buf[6], buf[7]]),
             },
-            encoding: (((buf[8] as u32) << 24)
-                | ((buf[9] as u32) << 16)
-                | ((buf[10] as u32) << 8)
-                | (buf[11] as u32))
-                .into(),
-        }
+            encoding: VncEncoding::try_from(u32::from_be_bytes([
+                buf[8], buf[9], buf[10], buf[11],
+            ]))?,
+        })
     }
 }
 
@@ -56,7 +56,7 @@ impl ImageRect {
     {
         let mut rect_buf = [0_u8; 12];
         reader.read_exact(&mut rect_buf).await?;
-        Ok(rect_buf.into())
+        rect_buf.try_into()
     }
 }
 
@@ -68,6 +68,7 @@ struct VncInner {
     decoding_stop: Option<oneshot::Sender<()>>,
     net_conn_stop: Option<oneshot::Sender<()>>,
     closed: bool,
+    limits: VncLimits,
 }
 
 /// The instance of a connected vnc client
@@ -78,13 +79,14 @@ impl VncInner {
         shared: bool,
         mut pixel_format: Option<PixelFormat>,
         encodings: Vec<VncEncoding>,
+        limits: VncLimits,
     ) -> Result<Self, VncError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let (conn_ch_tx, conn_ch_rx) = channel(CHANNEL_SIZE);
-        let (input_ch_tx, input_ch_rx) = channel(CHANNEL_SIZE);
-        let (output_ch_tx, output_ch_rx) = channel(CHANNEL_SIZE);
+        let (conn_ch_tx, conn_ch_rx) = channel(limits.channel_capacity);
+        let (input_ch_tx, input_ch_rx) = channel(limits.channel_capacity);
+        let (output_ch_tx, output_ch_rx) = channel(limits.channel_capacity);
         let (decoding_stop_tx, decoding_stop_rx) = oneshot::channel();
         let (net_conn_stop_tx, net_conn_stop_rx) = oneshot::channel();
 
@@ -93,7 +95,7 @@ impl VncInner {
 
         trace!("server init msg");
         let (name, (width, height)) =
-            read_server_init(&mut stream, &mut pixel_format, &|e| async {
+            read_server_init(&mut stream, &mut pixel_format, &limits, &|e| async {
                 output_ch_tx.send(e).await?;
                 Ok(())
             })
@@ -128,9 +130,16 @@ impl VncInner {
                 Ok(())
             };
 
-            let pf = pixel_format.as_ref().unwrap();
+            let Some(pf) = pixel_format.as_ref() else {
+                let _ = output_func(VncEvent::Error(
+                    "pixel format was not initialized".to_owned(),
+                ))
+                .await;
+                return;
+            };
             if let Err(e) =
-                asycn_vnc_read_loop(&mut conn_ch_rx, pf, &output_func, decoding_stop_rx).await
+                asycn_vnc_read_loop(&mut conn_ch_rx, pf, &limits, &output_func, decoding_stop_rx)
+                    .await
             {
                 if let VncError::IoError(e) = e {
                     if let std::io::ErrorKind::UnexpectedEof = e.kind() {
@@ -167,6 +176,7 @@ impl VncInner {
             decoding_stop: Some(decoding_stop_tx),
             net_conn_stop: Some(net_conn_stop_tx),
             closed: false,
+            limits,
         })
     }
 
@@ -197,7 +207,14 @@ impl VncInner {
                 X11Event::PointerEvent(mouse) => {
                     ClientMsg::PointerEvent(mouse.position_x, mouse.position_y, mouse.bottons)
                 }
-                X11Event::CopyText(text) => ClientMsg::ClientCutText(text),
+                X11Event::CopyText(text) => {
+                    ensure_limit(
+                        "client clipboard",
+                        text.len(),
+                        self.limits.max_clipboard_bytes,
+                    )?;
+                    ClientMsg::ClientCutText(text)
+                }
             };
             self.input_ch.send(msg).await?;
             Ok(())
@@ -237,12 +254,10 @@ impl VncInner {
     /// Stop the VNC engine and release resources
     ///
     fn close(&mut self) -> Result<(), VncError> {
-        if self.net_conn_stop.is_some() {
-            let net_conn_stop: oneshot::Sender<()> = self.net_conn_stop.take().unwrap();
+        if let Some(net_conn_stop) = self.net_conn_stop.take() {
             let _ = net_conn_stop.send(());
         }
-        if self.decoding_stop.is_some() {
-            let decoding_stop = self.decoding_stop.take().unwrap();
+        if let Some(decoding_stop) = self.decoding_stop.take() {
             let _ = decoding_stop.send(());
         }
         self.closed = true;
@@ -267,13 +282,14 @@ impl VncClient {
         shared: bool,
         pixel_format: Option<PixelFormat>,
         encodings: Vec<VncEncoding>,
+        limits: VncLimits,
     ) -> Result<Self, VncError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         Ok(Self {
             inner: Arc::new(Mutex::new(
-                VncInner::new(stream, shared, pixel_format, encodings).await?,
+                VncInner::new(stream, shared, pixel_format, encodings, limits).await?,
             )),
         })
     }
@@ -312,6 +328,47 @@ impl Clone for VncClient {
     }
 }
 
+fn ensure_limit(field: &'static str, actual: usize, limit: usize) -> Result<(), VncError> {
+    if actual > limit {
+        return Err(VncError::LimitExceeded {
+            field,
+            actual: actual as u64,
+            limit: limit as u64,
+        });
+    }
+    Ok(())
+}
+
+fn validate_framebuffer(width: u16, height: u16, limits: &VncLimits) -> Result<(), VncError> {
+    if width == 0
+        || height == 0
+        || width > limits.max_framebuffer_width
+        || height > limits.max_framebuffer_height
+    {
+        return Err(VncError::InvalidDimensions);
+    }
+    let pixels = usize::from(width)
+        .checked_mul(usize::from(height))
+        .ok_or(VncError::IntegerOverflow("framebuffer pixels"))?;
+    ensure_limit("framebuffer pixels", pixels, limits.max_framebuffer_pixels)
+}
+
+fn validate_rect(rect: &Rect, limits: &VncLimits) -> Result<(), VncError> {
+    if rect.width == 0 || rect.height == 0 {
+        return Err(VncError::InvalidDimensions);
+    }
+    rect.x
+        .checked_add(rect.width)
+        .ok_or(VncError::InvalidDimensions)?;
+    rect.y
+        .checked_add(rect.height)
+        .ok_or(VncError::InvalidDimensions)?;
+    let pixels = usize::from(rect.width)
+        .checked_mul(usize::from(rect.height))
+        .ok_or(VncError::IntegerOverflow("rectangle pixels"))?;
+    ensure_limit("rectangle pixels", pixels, limits.max_framebuffer_pixels)
+}
+
 async fn send_client_init<S>(stream: &mut S, shared: bool) -> Result<(), VncError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -324,6 +381,7 @@ where
 async fn read_server_init<S, F, Fut>(
     stream: &mut S,
     pf: &mut Option<PixelFormat>,
+    limits: &VncLimits,
     output_func: &F,
 ) -> Result<(String, (u16, u16)), VncError>
 where
@@ -343,6 +401,7 @@ where
 
     let screen_width = stream.read_u16().await?;
     let screen_height = stream.read_u16().await?;
+    validate_framebuffer(screen_width, screen_height, limits)?;
     let mut send_our_pf = false;
 
     output_func(VncEvent::SetResolution(
@@ -358,16 +417,16 @@ where
         send_our_pf = true;
     }
 
-    let name_len = stream.read_u32().await?;
-    let mut name_buf = vec![0_u8; name_len as usize];
+    let name_len = stream.read_u32().await? as usize;
+    ensure_limit("server name", name_len, limits.max_server_name_bytes)?;
+    let mut name_buf = vec![0_u8; name_len];
     stream.read_exact(&mut name_buf).await?;
     let name = String::from_utf8_lossy(&name_buf).into_owned();
 
     if send_our_pf {
         trace!("Send customized pixel format {:#?}", pf);
-        ClientMsg::SetPixelFormat(*pf.as_ref().unwrap())
-            .write(stream)
-            .await?;
+        let selected = pf.as_ref().copied().ok_or(VncError::WrongPixelFormat)?;
+        ClientMsg::SetPixelFormat(selected).write(stream).await?;
     }
     Ok((name, (screen_width, screen_height)))
 }
@@ -386,6 +445,7 @@ where
 async fn asycn_vnc_read_loop<S, F, Fut>(
     stream: &mut S,
     pf: &PixelFormat,
+    limits: &VncLimits,
     output_func: &F,
     mut stop_ch: oneshot::Receiver<()>,
 ) -> Result<(), VncError>
@@ -394,20 +454,28 @@ where
     F: Fn(VncEvent) -> Fut,
     Fut: Future<Output = Result<(), VncError>>,
 {
-    let mut raw_decoder = codec::RawDecoder::new();
-    let mut zrle_decoder = codec::ZrleDecoder::new();
-    let mut tight_decoder = codec::TightDecoder::new();
-    let mut trle_decoder = codec::TrleDecoder::new();
-    let mut cursor = codec::CursorDecoder::new();
+    let mut raw_decoder = codec::RawDecoder::new(*limits);
+    let mut zrle_decoder = codec::ZrleDecoder::new(*limits);
+    let mut tight_decoder = codec::TightDecoder::new(*limits);
+    let mut trle_decoder = codec::TrleDecoder::new(*limits);
+    let mut cursor = codec::CursorDecoder::new(*limits);
 
     // main decoding loop
     while let Err(oneshot::error::TryRecvError::Empty) = stop_ch.try_recv() {
-        let server_msg = ServerMsg::read(stream).await?;
+        let server_msg = ServerMsg::read(stream, limits).await?;
         trace!("Server message got: {:?}", server_msg);
         match server_msg {
             ServerMsg::FramebufferUpdate(rect_num) => {
+                if rect_num > limits.max_rectangles_per_update {
+                    return Err(VncError::LimitExceeded {
+                        field: "rectangles per update",
+                        actual: u64::from(rect_num),
+                        limit: u64::from(limits.max_rectangles_per_update),
+                    });
+                }
                 for _ in 0..rect_num {
                     let rect = ImageRect::read(stream).await?;
+                    validate_rect(&rect.rect, limits)?;
                     // trace!("Encoding: {:?}", rect.encoding);
 
                     match rect.encoding {
@@ -475,7 +543,7 @@ async fn async_connection_process_loop<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut buffer = [0; 65535];
+    let mut buffer = [0; NETWORK_CHUNK_SIZE];
     let mut pending = 0;
 
     // main traffic loop
@@ -526,3 +594,4 @@ where
 
     Ok(())
 }
+

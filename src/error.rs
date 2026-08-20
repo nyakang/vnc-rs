@@ -9,8 +9,6 @@ pub enum VncError {
     NoEncoding,
     #[error("Unknown VNC security type: {0}")]
     InvalidSecurityType(u32),
-    #[error("Unknow VNC security type: {0}")]
-    InvalidSecurityTyep(u8),
     #[error("Unknown VNC security result: {0}")]
     InvalidSecurityResult(u32),
     #[error("Unknown VNC encoding: {0}")]

@@ -46,13 +46,14 @@ fn compute_subkeys(key: u64) -> Vec<u64> {
     let k0 = pc1(key);
     let mut subkeys = vec![k0];
 
+    let mut last_key = k0;
     for shift_count in &table {
-        let last_key = subkeys.last().unwrap();
         let last_ci = last_key & 0xFFFFFFF000000000;
         let last_di = last_key << HALF_KEY_SIZE;
         let (ci, di) = circular_left_shift(last_ci, last_di, *shift_count);
         let current_key = ci | (di >> HALF_KEY_SIZE);
         subkeys.push(current_key);
+        last_key = current_key;
     }
 
     subkeys.remove(0);

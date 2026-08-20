@@ -1,14 +1,16 @@
-use crate::{PixelFormat, Rect, VncError, VncEvent};
+use crate::{PixelFormat, Rect, VncError, VncEvent, VncLimits};
 use std::future::Future;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use super::uninit_vec;
+use super::{checked_buffer_size, uninit_vec};
 
-pub struct Decoder {}
+pub struct Decoder {
+    limits: VncLimits,
+}
 
 impl Decoder {
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(limits: VncLimits) -> Self {
+        Self { limits }
     }
 
     pub async fn decode<S, F, Fut>(
@@ -23,13 +25,8 @@ impl Decoder {
         F: Fn(VncEvent) -> Fut,
         Fut: Future<Output = Result<(), VncError>>,
     {
-        // +----------------------------+--------------+-------------+
-        // | No. of bytes               | Type [Value] | Description |
-        // +----------------------------+--------------+-------------+
-        // | width*height*bytesPerPixel | PIXEL array  | pixels      |
-        // +----------------------------+--------------+-------------+
-        let bpp = format.bits_per_pixel / 8;
-        let buffer_size = bpp as usize * rect.height as usize * rect.width as usize;
+        let bpp = usize::from(format.bits_per_pixel / 8);
+        let buffer_size = checked_buffer_size(rect, bpp, &self.limits)?;
         let mut pixels = uninit_vec(buffer_size);
         input.read_exact(&mut pixels).await?;
         output_func(VncEvent::RawImage(*rect, pixels)).await?;

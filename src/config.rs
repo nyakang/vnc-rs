@@ -18,21 +18,20 @@ pub enum VncEncoding {
     LastRectPseudo = -224,
 }
 
-impl From<u32> for VncEncoding {
-    fn from(num: u32) -> Self {
-        // Safe match instead of transmute — unknown encoding IDs fall back to Raw
-        // instead of causing UB (the original transmute is unsound for any value
-        // not matching a valid discriminant).
+impl TryFrom<u32> for VncEncoding {
+    type Error = VncError;
+
+    fn try_from(num: u32) -> Result<Self, Self::Error> {
         match num as i32 {
-            0 => VncEncoding::Raw,
-            1 => VncEncoding::CopyRect,
-            7 => VncEncoding::Tight,
-            15 => VncEncoding::Trle,
-            16 => VncEncoding::Zrle,
-            -239 => VncEncoding::CursorPseudo,
-            -223 => VncEncoding::DesktopSizePseudo,
-            -224 => VncEncoding::LastRectPseudo,
-            _ => VncEncoding::Raw,
+            0 => Ok(Self::Raw),
+            1 => Ok(Self::CopyRect),
+            7 => Ok(Self::Tight),
+            15 => Ok(Self::Trle),
+            16 => Ok(Self::Zrle),
+            -239 => Ok(Self::CursorPseudo),
+            -223 => Ok(Self::DesktopSizePseudo),
+            -224 => Ok(Self::LastRectPseudo),
+            invalid => Err(VncError::InvalidEncoding(invalid)),
         }
     }
 }
@@ -188,9 +187,9 @@ impl TryFrom<[u8; 16]> for PixelFormat {
         let depth = pf[1];
         let big_endian_flag = pf[2];
         let true_color_flag = pf[3];
-        let red_max = u16::from_be_bytes(pf[4..6].try_into().unwrap());
-        let green_max = u16::from_be_bytes(pf[6..8].try_into().unwrap());
-        let blue_max = u16::from_be_bytes(pf[8..10].try_into().unwrap());
+        let red_max = u16::from_be_bytes([pf[4], pf[5]]);
+        let green_max = u16::from_be_bytes([pf[6], pf[7]]);
+        let blue_max = u16::from_be_bytes([pf[8], pf[9]]);
         let red_shift = pf[10];
         let green_shift = pf[11];
         let blue_shift = pf[12];

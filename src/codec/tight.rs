@@ -1,10 +1,13 @@
-use crate::{PixelFormat, Rect, VncError, VncEvent};
+use crate::{PixelFormat, Rect, VncError, VncEvent, VncLimits};
 use std::future::Future;
 use std::io::Read;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::error;
 
-use super::{uninit_vec, zlib::ZlibReader};
+use super::{
+    alpha_shift, checked_pixel_count, checked_rgb_size, checked_rgba_size, ensure_payload_limit,
+    rgb_to_pixel, uninit_vec, zlib::ZlibReader,
+};
 
 const MAX_PALETTE: usize = 256;
 
@@ -15,12 +18,14 @@ pub struct Decoder {
     filter: u8,
     palette: Vec<u8>,
     alpha_shift: u32,
+    limits: VncLimits,
 }
 
 impl Decoder {
-    pub fn new() -> Self {
+    pub fn new(limits: VncLimits) -> Self {
         let mut new = Self {
             palette: Vec::with_capacity(MAX_PALETTE * 4),
+            limits,
             ..Default::default()
         };
         for i in 0..4 {
@@ -42,22 +47,15 @@ impl Decoder {
         F: Fn(VncEvent) -> Fut,
         Fut: Future<Output = Result<(), VncError>>,
     {
-        let pixel_mask = ((format.red_max as u32) << format.red_shift)
-            | ((format.green_max as u32) << format.green_shift)
-            | ((format.blue_max as u32) << format.blue_shift);
-
-        self.alpha_shift = match pixel_mask {
-            0xff_ff_ff_00 => 0,
-            0xff_ff_00_ff => 8,
-            0xff_00_ff_ff => 16,
-            0x00_ff_ff_ff => 24,
-            _ => unreachable!(),
-        };
+        self.alpha_shift = alpha_shift(format)?;
 
         let ctrl = input.read_u8().await?;
         for i in 0..4 {
             if (ctrl >> i) & 1 == 1 {
-                self.zlibs[i].as_mut().unwrap().reset(true);
+                self.zlibs[i]
+                    .as_mut()
+                    .ok_or(VncError::InvalidImageData)?
+                    .reset(true);
             }
         }
 
@@ -93,21 +91,12 @@ impl Decoder {
     where
         S: AsyncRead + Unpin,
     {
-        let len = {
-            let mut len;
-            let mut byte = input.read_u8().await? as usize;
-            len = byte & 0x7f;
-            if byte & 0x80 == 0x80 {
-                byte = input.read_u8().await? as usize;
-                len |= (byte & 0x7f) << 7;
-
-                if byte & 0x80 == 0x80 {
-                    byte = input.read_u8().await? as usize;
-                    len |= byte << 14;
-                }
-            }
-            len
-        };
+        let len = read_compact_length(input).await?;
+        ensure_payload_limit(
+            "tight encoded payload",
+            len,
+            self.limits.max_encoded_payload_bytes,
+        )?;
         let mut data = uninit_vec(len);
         input.read_exact(&mut data).await?;
         Ok(data)
@@ -127,15 +116,17 @@ impl Decoder {
     {
         let mut color = [0; 3];
         input.read_exact(&mut color).await?;
-        let bpp = format.bits_per_pixel as usize / 8;
-        let mut image = Vec::with_capacity(rect.width as usize * rect.height as usize * bpp);
+        let image_size = checked_rgba_size(rect, &self.limits)?;
+        let pixel_count = checked_pixel_count(rect)?;
+        let mut image = Vec::with_capacity(image_size);
 
         let true_color = self.to_true_color(format, &color);
 
-        for _ in 0..rect.width {
-            for _ in 0..rect.height {
-                image.extend_from_slice(&true_color);
-            }
+        for _ in 0..pixel_count {
+            image.extend_from_slice(&true_color);
+        }
+        if image.len() != image_size {
+            return Err(VncError::InvalidImageData);
         }
         output_func(VncEvent::RawImage(*rect, image)).await?;
         Ok(())
@@ -215,7 +206,7 @@ impl Decoder {
         F: Fn(VncEvent) -> Fut,
         Fut: Future<Output = Result<(), VncError>>,
     {
-        let uncompressed_size = rect.width as usize * rect.height as usize * 3;
+        let uncompressed_size = checked_rgb_size(rect, &self.limits)?;
         if uncompressed_size == 0 {
             return Ok(());
         };
@@ -223,11 +214,15 @@ impl Decoder {
         let data = self
             .read_tight_data(stream, input, uncompressed_size)
             .await?;
-        let mut image = Vec::with_capacity(uncompressed_size / 3 * 4);
+        let image_size = checked_rgba_size(rect, &self.limits)?;
+        let mut image = Vec::with_capacity(image_size);
         let mut j = 0;
         while j < uncompressed_size {
             image.extend_from_slice(&self.to_true_color(format, &data[j..j + 3]));
             j += 3;
+        }
+        if image.len() != image_size {
+            return Err(VncError::InvalidImageData);
         }
 
         output_func(VncEvent::RawImage(*rect, image)).await?;
@@ -249,14 +244,26 @@ impl Decoder {
         Fut: Future<Output = Result<(), VncError>>,
     {
         let num_colors = input.read_u8().await? as usize + 1;
-        let palette_size = num_colors * 3;
+        let palette_size = num_colors
+            .checked_mul(3)
+            .ok_or(VncError::IntegerOverflow("tight palette size"))?;
 
         self.palette = uninit_vec(palette_size);
         input.read_exact(&mut self.palette).await?;
 
         let bpp = if num_colors <= 2 { 1 } else { 8 };
-        let row_size = (rect.width as usize * bpp).div_ceil(8);
-        let uncompressed_size = rect.height as usize * row_size;
+        let row_size = usize::from(rect.width)
+            .checked_mul(bpp)
+            .ok_or(VncError::IntegerOverflow("tight palette row bits"))?
+            .div_ceil(8);
+        let uncompressed_size = usize::from(rect.height)
+            .checked_mul(row_size)
+            .ok_or(VncError::IntegerOverflow("tight palette decoded bytes"))?;
+        ensure_payload_limit(
+            "tight palette decoded payload",
+            uncompressed_size,
+            self.limits.max_decoded_payload_bytes,
+        )?;
 
         if uncompressed_size == 0 {
             return Ok(());
@@ -287,22 +294,30 @@ impl Decoder {
         Fut: Future<Output = Result<(), VncError>>,
     {
         // Convert indexed (palette based) image data to RGB
-        let total = rect.width as usize * rect.height as usize;
-        let mut image = uninit_vec(total * 4);
+        let total = checked_pixel_count(rect)?;
+        let mut image = uninit_vec(checked_rgba_size(rect, &self.limits)?);
         let mut offset = 8_usize;
-        let mut index = -1_isize;
+        let mut index = 0_usize;
         let mut dp = 0;
         for i in 0..total {
-            if offset == 0 || i % rect.width as usize == 0 {
+            if i % usize::from(rect.width) == 0 {
                 offset = 8;
-                index += 1;
+                if i != 0 {
+                    index = index
+                        .checked_add(1)
+                        .ok_or(VncError::IntegerOverflow("tight mono row index"))?;
+                }
+            } else if offset == 0 {
+                offset = 8;
+                index = index
+                    .checked_add(1)
+                    .ok_or(VncError::IntegerOverflow("tight mono byte index"))?;
             }
+            let packed = data.get(index).ok_or(VncError::InvalidImageData)?;
             offset -= 1;
-            let sp = ((data[index as usize] >> offset) & 0x01) as usize * 3;
+            let sp = usize::from((packed >> offset) & 0x01) * 3;
             let true_color = self.to_true_color(format, &self.palette[sp..sp + 3]);
-            unsafe {
-                std::ptr::copy_nonoverlapping(true_color.as_ptr(), image.as_mut_ptr().add(dp), 4)
-            }
+            image[dp..dp + 4].copy_from_slice(&true_color);
             dp += 4;
         }
         output_func(VncEvent::RawImage(*rect, image)).await?;
@@ -321,16 +336,18 @@ impl Decoder {
         Fut: Future<Output = Result<(), VncError>>,
     {
         // Convert indexed (palette based) image data to RGB
-        let total = rect.width as usize * rect.height as usize;
-        let mut image = uninit_vec(total * 4);
+        let total = checked_pixel_count(rect)?;
+        let mut image = uninit_vec(checked_rgba_size(rect, &self.limits)?);
         let mut i = 0;
         let mut dp = 0;
         while i < total {
             let sp = data[i] as usize * 3;
-            let true_color = self.to_true_color(format, &self.palette[sp..sp + 3]);
-            unsafe {
-                std::ptr::copy_nonoverlapping(true_color.as_ptr(), image.as_mut_ptr().add(dp), 4)
-            }
+            let color = self
+                .palette
+                .get(sp..sp + 3)
+                .ok_or(VncError::InvalidImageData)?;
+            let true_color = self.to_true_color(format, color);
+            image[dp..dp + 4].copy_from_slice(&true_color);
             dp += 4;
             i += 1;
         }
@@ -351,20 +368,22 @@ impl Decoder {
         F: Fn(VncEvent) -> Fut,
         Fut: Future<Output = Result<(), VncError>>,
     {
-        let uncompressed_size = rect.width as usize * rect.height as usize * 3;
+        let uncompressed_size = checked_rgb_size(rect, &self.limits)?;
         if uncompressed_size == 0 {
             return Ok(());
         };
         let data = self
             .read_tight_data(stream, input, uncompressed_size)
             .await?;
-        let mut image = uninit_vec(rect.width as usize * rect.height as usize * 4);
+        let mut image = uninit_vec(checked_rgba_size(rect, &self.limits)?);
 
-        let row_len = rect.width as usize * 3 + 3;
+        let row_len = usize::from(rect.width)
+            .checked_mul(3)
+            .and_then(|bytes| bytes.checked_add(3))
+            .ok_or(VncError::IntegerOverflow("tight gradient row length"))?;
         let mut row_0 = vec![0_u16; row_len];
         let mut row_1 = vec![0_u16; row_len];
         let max = [format.red_max, format.green_max, format.blue_max];
-        let shift = [format.red_shift, format.green_shift, format.blue_shift];
         let mut sp = 0;
         let mut dp = 0;
 
@@ -372,12 +391,11 @@ impl Decoder {
             let (this_row, prev_row) = match y & 1 {
                 0 => (&mut row_0, &mut row_1),
                 1 => (&mut row_1, &mut row_0),
-                _ => unreachable!(),
+                _ => return Err(VncError::WrongPixelFormat),
             };
             let mut x = 3;
             while x < row_len {
                 let rgb = &data[sp..sp + 3];
-                let mut color = 0;
                 for index in 0..3 {
                     let d = prev_row[index + x] as i32 + this_row[index + x - 3] as i32
                         - prev_row[index + x - 3] as i32;
@@ -389,15 +407,13 @@ impl Decoder {
                         d as u16
                     };
                     this_row[index + x] = (converted + rgb[index] as u16) & max[index];
-                    color |= (this_row[x + index] as u32 & max[index] as u32) << shift[index];
                 }
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        color.to_le_bytes().as_ptr(),
-                        image.as_mut_ptr().add(dp),
-                        4,
-                    )
-                }
+                let color = [
+                    this_row[x] as u8,
+                    this_row[x + 1] as u8,
+                    this_row[x + 2] as u8,
+                ];
+                image[dp..dp + 4].copy_from_slice(&self.to_true_color(format, &color));
                 dp += 4;
                 sp += 3;
                 x += 3;
@@ -417,13 +433,21 @@ impl Decoder {
     where
         S: AsyncRead + Unpin,
     {
+        ensure_payload_limit(
+            "tight decoded payload",
+            uncompressed_size,
+            self.limits.max_decoded_payload_bytes,
+        )?;
         let mut data;
         if uncompressed_size < 12 {
             data = uninit_vec(uncompressed_size);
             input.read_exact(&mut data).await?;
         } else {
             let d = self.read_data(input).await?;
-            let mut reader = ZlibReader::new(self.zlibs[stream as usize].take().unwrap(), &d);
+            let decompressor = self.zlibs[stream as usize]
+                .take()
+                .ok_or(VncError::InvalidImageData)?;
+            let mut reader = ZlibReader::new(decompressor, &d);
             data = uninit_vec(uncompressed_size);
             reader.read_exact(&mut data)?;
             self.zlibs[stream as usize] = Some(reader.into_inner()?);
@@ -432,12 +456,27 @@ impl Decoder {
     }
 
     fn to_true_color(&self, format: &PixelFormat, color: &[u8]) -> [u8; 4] {
-        let alpha = 255;
-        // always rgb
-        (((color[0] as u32 & format.red_max as u32) << format.red_shift)
-            | ((color[1] as u32 & format.green_max as u32) << format.green_shift)
-            | ((color[2] as u32 & format.blue_max as u32) << format.blue_shift)
-            | ((alpha as u32) << self.alpha_shift))
-            .to_le_bytes()
+        rgb_to_pixel(format, self.alpha_shift, color).expect("validated tight RGB color")
     }
 }
+
+async fn read_compact_length<S>(input: &mut S) -> Result<usize, VncError>
+where
+    S: AsyncRead + Unpin,
+{
+    let first = input.read_u8().await?;
+    let mut len = usize::from(first & 0x7f);
+    if first & 0x80 != 0 {
+        let second = input.read_u8().await?;
+        len |= usize::from(second & 0x7f) << 7;
+        if second & 0x80 != 0 {
+            let third = input.read_u8().await?;
+            if third & 0x80 != 0 {
+                return Err(VncError::InvalidImageData);
+            }
+            len |= usize::from(third) << 14;
+        }
+    }
+    Ok(len)
+}
+
