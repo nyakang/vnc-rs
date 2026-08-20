@@ -212,9 +212,11 @@ mod codec;
 pub mod config;
 pub mod error;
 pub mod event;
+pub mod limits;
 
 pub use client::VncClient;
 pub use client::VncConnector;
 pub use config::*;
 pub use error::*;
 pub use event::*;
+pub use limits::VncLimits;

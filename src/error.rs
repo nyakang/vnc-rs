@@ -7,10 +7,32 @@ pub enum VncError {
     NoPassword,
     #[error("No VNC encoding selected")]
     NoEncoding,
+    #[error("Unknown VNC security type: {0}")]
+    InvalidSecurityType(u32),
     #[error("Unknow VNC security type: {0}")]
     InvalidSecurityTyep(u8),
+    #[error("Unknown VNC security result: {0}")]
+    InvalidSecurityResult(u32),
+    #[error("Unknown VNC encoding: {0}")]
+    InvalidEncoding(i32),
+    #[error("Unsupported VNC security type")]
+    UnsupportedSecurityType,
+    #[error("Server did not offer the required VNC security type: {0}")]
+    RequiredSecurityTypeUnavailable(&'static str),
     #[error("Wrong password")]
     WrongPassword,
+    #[error("Server rejected the connection: {0}")]
+    SecurityFailure(String),
+    #[error("Protocol limit exceeded for {field}: {actual} > {limit}")]
+    LimitExceeded {
+        field: &'static str,
+        actual: u64,
+        limit: u64,
+    },
+    #[error("Invalid framebuffer or rectangle dimensions")]
+    InvalidDimensions,
+    #[error("Integer overflow while calculating {0}")]
+    IntegerOverflow(&'static str),
     #[error("Connect error with unknown reason")]
     ConnectError,
     #[error("Unknown pixel format")]
