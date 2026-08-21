@@ -135,7 +135,7 @@ impl Decoder {
                 let control = input.read_u8().await?;
                 let is_rle = control & 0x80 > 0;
                 let palette_size = control & 0x7f;
-                palette.truncate(0);
+                palette.clear();
 
                 for _ in 0..palette_size {
                     copy_true_color(input, &mut palette, alpha_at_first, compressed_bpp, bpp)
@@ -190,7 +190,7 @@ impl Decoder {
                         let mut count = 0;
                         let mut pixel = Vec::new();
                         while count < pixel_count {
-                            pixel.truncate(0);
+                            pixel.clear();
                             copy_true_color(input, &mut pixel, alpha_at_first, compressed_bpp, bpp)
                                 .await?;
                             let run_length = read_run_length(input).await?;
