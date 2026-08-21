@@ -35,6 +35,12 @@ decoder tests and interoperability checks pass.
    `VncSecurityPolicy::{Auto, NoneOnly, VncAuthOnly}`.
 6. `test: add handshake, decoder, and limit regression tests`.
 7. `deps: narrow the tokio feature set and drop the release profile override`.
+8. `style(codec): clear palette and pixel buffers with clear()` — `truncate(0)`
+   tripped clippy's `manual_clear`, which postdates the code and fails
+   `-D warnings` on the base revision too. Behaviour is identical.
+9. `test(codec): satisfy clippy on test targets` — struct update syntax for the
+   `VncLimits` test values, and `zrle.rs`'s test module moved to the end of the
+   file.
 
 ## Not carried here
 
@@ -44,9 +50,20 @@ repository gitignores the lock file).
 
 ## Validation
 
+`.github/workflows/nyaterm.yml` runs this on every push to the branch, because
+upstream's `build.yml` only triggers on `main`. These tests used to run inside
+NyaTerm's own `cargo test --workspace` while this crate was a path dependency in
+that workspace; NyaTerm now consumes it as a pinned git dependency, so this
+branch is the only place they run.
+
 ```sh
-cargo fmt --check
-cargo check
-cargo test
-cargo test --release
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features            # 24 passed
+cargo test --release --all-features  # 24 passed, and release matters: an
+                                     # unchecked overflow panics in debug but
+                                     # wraps in release
+cargo test --doc --all-features
+cargo build                          # plus windows and wasm32-unknown-unknown
 ```
