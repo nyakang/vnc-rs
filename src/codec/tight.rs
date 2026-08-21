@@ -695,8 +695,10 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_tight_encoded_and_decoded_bombs() {
-        let mut limits = VncLimits::default();
-        limits.max_encoded_payload_bytes = 1;
+        let limits = VncLimits {
+            max_encoded_payload_bytes: 1,
+            ..VncLimits::default()
+        };
         let mut decoder = Decoder::new(limits);
         let payload = encoded_compressed_rect(0, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
         let mut input = std::io::Cursor::new(payload);
@@ -712,8 +714,10 @@ mod tests {
             })
         ));
 
-        let mut limits = VncLimits::default();
-        limits.max_decoded_payload_bytes = 3;
+        let limits = VncLimits {
+            max_decoded_payload_bytes: 3,
+            ..VncLimits::default()
+        };
         let mut decoder = Decoder::new(limits);
         let payload = encoded_rect(0, &[1, 2, 3, 4, 5, 6]);
         let mut input = std::io::Cursor::new(payload);
