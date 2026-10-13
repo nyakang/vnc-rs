@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! # VNC-RS
 //!
 //! ## Description
@@ -214,11 +216,11 @@ mod desktop;
 pub mod error;
 pub mod event;
 pub use desktop::*;
+pub mod limits;
 
 pub use client::VncClient;
 pub use client::VncConnector;
 pub use config::*;
 pub use error::*;
 pub use event::*;
-
-mod limits;
+pub use limits::VncLimits;
