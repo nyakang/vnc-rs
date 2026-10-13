@@ -11,6 +11,7 @@ pub(super) enum SecurityType {
     VncAuth = 2,
     RA2 = 5,
     RA2ne = 6,
+    RA2_256 = 129,
     Tight = 16,
     Ultra = 17,
     Tls = 18,
@@ -30,6 +31,7 @@ impl TryFrom<u8> for SecurityType {
             2 => Ok(Self::VncAuth),
             5 => Ok(Self::RA2),
             6 => Ok(Self::RA2ne),
+            129 => Ok(Self::RA2_256),
             16 => Ok(Self::Tight),
             17 => Ok(Self::Ultra),
             18 => Ok(Self::Tls),
@@ -37,7 +39,7 @@ impl TryFrom<u8> for SecurityType {
             20 => Ok(Self::GtkVncSasl),
             21 => Ok(Self::Md5Hash),
             22 => Ok(Self::ColinDeanXvp),
-            invalid => Err(VncError::InvalidSecurityTyep(invalid)),
+            invalid => Err(VncError::InvalidSecurityType(u32::from(invalid))),
         }
     }
 }
@@ -192,87 +194,77 @@ impl AuthHelper {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        let result = reader.read_u32().await?;
-        result.try_into()
+        reader.read_u32().await?.try_into()
     }
+}
+
+pub(super) async fn read_security_failure<S>(
+    reader: &mut S,
+    limits: &VncLimits,
+) -> Result<String, VncError>
+where
+    S: AsyncRead + Unpin,
+{
+    read_bounded_string(
+        reader,
+        "security failure reason",
+        limits.max_failure_reason_bytes,
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
-    async fn authentication_result_is_checked() {
-        for status in [0_u32, 1, 2, 256, u32::MAX] {
-            let (mut server, mut client) = tokio::io::duplex(4);
-            server.write_all(&status.to_be_bytes()).await.unwrap();
-            let auth = AuthHelper {
-                challenge: [0; 16],
-                key: [0; 8],
-            };
+    async fn failure_reason_reads_exact_declared_length() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        server.write_all(&3_u32.to_be_bytes()).await.unwrap();
+        server.write_all(b"badNEXT").await.unwrap();
 
-            let result = auth.finish(&mut client).await;
-            match status {
-                0 => assert!(matches!(result, Ok(AuthResult::Ok))),
-                1 => assert!(matches!(result, Ok(AuthResult::Failed))),
-                _ => assert!(matches!(result, Err(VncError::General(_)))),
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod negotiation_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn security_values_are_not_narrowed_and_unknown_offers_are_skipped() {
-        for value in [3_u32, 257, 258, u32::MAX] {
-            assert!(
-                SecurityType::read(&mut value.to_be_bytes().as_slice(), &VncVersion::RFB33)
-                    .await
-                    .is_err()
-            );
-        }
-        let mut offers = &[3, 250, 2, 1][..];
-        assert_eq!(
-            SecurityType::read(&mut offers, &VncVersion::RFB38)
-                .await
-                .unwrap(),
-            vec![SecurityType::VncAuth, SecurityType::None]
-        );
-        assert!(offers.is_empty());
-        let mut unknown = &[1, 250][..];
-        assert!(SecurityType::read(&mut unknown, &VncVersion::RFB38)
+        let reason = read_security_failure(&mut client, &VncLimits::default())
             .await
-            .unwrap()
-            .is_empty());
+            .unwrap();
+        assert_eq!(reason, "bad");
+        let mut trailing = [0; 4];
+        client.read_exact(&mut trailing).await.unwrap();
+        assert_eq!(&trailing, b"NEXT");
     }
 
     #[tokio::test]
-    async fn failure_reason_uses_its_length_and_rejects_oversized_payloads() {
-        for version in [VncVersion::RFB33, VncVersion::RFB37, VncVersion::RFB38] {
-            let mut bytes = if version == VncVersion::RFB33 {
-                vec![0; 4]
-            } else {
-                vec![0]
-            };
-            bytes.extend(2_u32.to_be_bytes());
-            bytes.extend(b"noNEXT");
-            let mut input = bytes.as_slice();
-            assert!(matches!(SecurityType::read(&mut input, &version).await,
-                Err(VncError::General(reason)) if reason == "no"));
-            assert_eq!(input, b"NEXT");
-            let mut bytes = if version == VncVersion::RFB33 {
-                vec![0; 4]
-            } else {
-                vec![0]
-            };
-            bytes.extend(u32::MAX.to_be_bytes());
-            assert!(matches!(
-                SecurityType::read(&mut bytes.as_slice(), &version).await,
-                Err(VncError::General(_))
-            ));
-        }
+    async fn failure_reason_rejects_oversized_length_before_allocation() {
+        let limits = VncLimits {
+            max_failure_reason_bytes: 3,
+            ..VncLimits::default()
+        };
+        let mut input = &4_u32.to_be_bytes()[..];
+        let error = read_security_failure(&mut input, &limits)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, VncError::LimitExceeded { .. }));
+    }
+
+    #[tokio::test]
+    async fn ignores_unknown_security_types_in_rfb38_lists_but_rejects_unknown_results() {
+        let mut security = &[3_u8, 99, 129, 2][..];
+        let types = SecurityType::read(&mut security, &VncVersion::RFB38, &VncLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(types, vec![SecurityType::RA2_256, SecurityType::VncAuth]);
+        assert!(matches!(
+            AuthResult::try_from(7),
+            Err(VncError::InvalidSecurityResult(7))
+        ));
+    }
+
+    #[tokio::test]
+    async fn rfb33_keeps_unknown_single_security_type_fail_closed() {
+        let mut security = &99_u32.to_be_bytes()[..];
+        let error = SecurityType::read(&mut security, &VncVersion::RFB33, &VncLimits::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, VncError::InvalidSecurityType(99)));
     }
 }

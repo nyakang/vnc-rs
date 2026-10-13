@@ -19,6 +19,44 @@ pub enum VncError {
     RequiredSecurityTypeUnavailable(&'static str),
     #[error("Wrong password")]
     WrongPassword,
+    #[error("VNC credential is too long for {field}: {actual} > {limit} bytes")]
+    CredentialTooLong {
+        field: &'static str,
+        actual: usize,
+        limit: usize,
+    },
+    #[error("RA2 server key length is outside the supported range: {actual} bits (expected {min}..={max})")]
+    InvalidRa2KeyLength { actual: u32, min: u32, max: u32 },
+    #[error("Invalid RA2 RSA public key")]
+    InvalidRa2PublicKey,
+    #[error("Invalid RA2 encrypted random length: {actual} bytes, expected {expected}")]
+    InvalidRa2EncryptedRandomLength { actual: usize, expected: usize },
+    #[error("Invalid RA2 decrypted random length: {0} bytes")]
+    InvalidRa2RandomLength(usize),
+    #[error("RA2 server public-key hash verification failed")]
+    Ra2ServerHashMismatch,
+    #[error("Unknown RA2 authentication subtype: {0}")]
+    InvalidRa2Subtype(u8),
+    #[error("RA2 server key verification callback is required")]
+    Ra2ServerKeyVerifierRequired,
+    #[error("RA2 server key was rejected: {0}")]
+    Ra2ServerKeyRejected(String),
+    #[error("Invalid RA2 record size limit: {0}")]
+    InvalidRa2RecordLimit(usize),
+    #[error("RA2 cryptographic operation failed: {0}")]
+    Ra2Crypto(&'static str),
+    #[error("Server rejected the connection: {0}")]
+    SecurityFailure(String),
+    #[error("Protocol limit exceeded for {field}: {actual} > {limit}")]
+    LimitExceeded {
+        field: &'static str,
+        actual: u64,
+        limit: u64,
+    },
+    #[error("Invalid framebuffer or rectangle dimensions")]
+    InvalidDimensions,
+    #[error("Integer overflow while calculating {0}")]
+    IntegerOverflow(&'static str),
     #[error("Connect error with unknown reason")]
     ConnectError,
     #[error("Unknown pixel format")]
