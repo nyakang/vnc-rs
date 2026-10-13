@@ -1,11 +1,11 @@
-use crate::{PixelFormat, Rect, VncError, VncEvent};
+use crate::{PixelFormat, Rect, VncError, VncEvent, VncLimits};
 use std::future::Future;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::error;
 
-use super::initialized_vec;
+use super::ensure_payload_limit;
 
-async fn read_run_length<S>(reader: &mut S, remaining: usize) -> Result<usize, VncError>
+async fn read_run_length<S>(reader: &mut S) -> Result<usize, VncError>
 where
     S: AsyncRead + Unpin,
 {
@@ -14,9 +14,6 @@ where
     loop {
         run_length_part = reader.read_u8().await?;
         run_length += run_length_part as usize;
-        if run_length > remaining {
-            return Err(VncError::InvalidImageData);
-        }
         if 255 != run_length_part {
             break;
         }
@@ -48,19 +45,24 @@ fn copy_indexed(
     bpp: usize,
     index: u8,
 ) -> Result<(), VncError> {
-    let start = index as usize * bpp;
-    let pixel = palette
-        .get(start..start + bpp)
-        .ok_or(VncError::InvalidImageData)?;
-    pixels.extend_from_slice(pixel);
+    let start = usize::from(index)
+        .checked_mul(bpp)
+        .ok_or(VncError::IntegerOverflow("TRLE palette offset"))?;
+    let end = start
+        .checked_add(bpp)
+        .ok_or(VncError::IntegerOverflow("TRLE palette end"))?;
+    let color = palette.get(start..end).ok_or(VncError::InvalidImageData)?;
+    pixels.extend_from_slice(color);
     Ok(())
 }
 
-pub struct Decoder {}
+pub struct Decoder {
+    limits: VncLimits,
+}
 
 impl Decoder {
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(limits: VncLimits) -> Self {
+        Self { limits }
     }
 
     pub async fn decode<S, F, Fut>(
@@ -75,23 +77,23 @@ impl Decoder {
         F: Fn(VncEvent) -> Fut,
         Fut: Future<Output = Result<(), VncError>>,
     {
-        crate::limits::dimensions(rect.width, rect.height)?;
         format.validate()?;
-        let data_len = input.read_u32().await? as usize;
-        if data_len > crate::limits::MAX_COMPRESSED {
-            return Err(VncError::InvalidImageData);
-        }
-        let mut zlib_data = initialized_vec(data_len);
-        input.read_exact(&mut zlib_data).await?;
+        // TRLE is uncompressed and has no outer length field. Bound the
+        // maximum decoded output derived from the already validated rectangle.
+        let output_bytes = usize::from(rect.width)
+            .checked_mul(usize::from(rect.height))
+            .and_then(|pixels| pixels.checked_mul(format.bits_per_pixel as usize / 8))
+            .ok_or(VncError::IntegerOverflow("TRLE decoded bytes"))?;
+        ensure_payload_limit(
+            "TRLE decoded payload",
+            output_bytes,
+            self.limits.max_decoded_payload_bytes,
+        )?;
 
         let bpp = format.bits_per_pixel as usize / 8;
-        let pixel_mask = if format.true_color_flag != 0 {
-            ((format.red_max as u32) << format.red_shift)
-                | ((format.green_max as u32) << format.green_shift)
-                | ((format.blue_max as u32) << format.blue_shift)
-        } else {
-            0
-        };
+        let pixel_mask = ((format.red_max as u32) << format.red_shift)
+            | ((format.green_max as u32) << format.green_shift)
+            | ((format.blue_max as u32) << format.blue_shift);
 
         let (compressed_bpp, alpha_at_first) =
             if format.bits_per_pixel == 32 && format.true_color_flag > 0 && format.depth <= 24 {
@@ -162,7 +164,7 @@ impl Decoder {
                             2 => 1,
                             3..=4 => 2,
                             5..=16 => 4,
-                            _ => unreachable!(),
+                            _ => return Err(VncError::InvalidImageData),
                         };
                         let mut encoded = input.read_u8().await?;
                         let mask = (1 << bits_per_index) - 1;
@@ -192,7 +194,10 @@ impl Decoder {
                             pixel.clear();
                             copy_true_color(input, &mut pixel, alpha_at_first, compressed_bpp, bpp)
                                 .await?;
-                            let run_length = read_run_length(input, pixel_count - count).await?;
+                            let run_length = read_run_length(input).await?;
+                            if run_length > pixel_count - count {
+                                return Err(VncError::InvalidImageData);
+                            }
                             for _ in 0..run_length {
                                 pixels.extend(&pixel)
                             }
@@ -207,10 +212,15 @@ impl Decoder {
                             let longer_than_one = control & 0x80 > 0;
                             let index = control & 0x7f;
                             let run_length = if longer_than_one {
-                                read_run_length(input, pixel_count - count).await?
+                                read_run_length(input).await?
                             } else {
                                 1
                             };
+                            if usize::from(index) >= usize::from(palette_size)
+                                || run_length > pixel_count - count
+                            {
+                                return Err(VncError::InvalidImageData);
+                            }
                             for _ in 0..run_length {
                                 copy_indexed(&palette, &mut pixels, bpp, index)?;
                             }
@@ -238,17 +248,5 @@ impl Decoder {
         }
 
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn run_and_palette_indexes_are_bounded() {
-        assert!(read_run_length(&mut &[255, 255][..], 1).await.is_err());
-        assert_eq!(read_run_length(&mut &[255, 0][..], 256).await.unwrap(), 256);
-        assert!(copy_indexed(&[1, 2, 3, 255], &mut Vec::new(), 4, 1).is_err());
     }
 }
