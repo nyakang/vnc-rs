@@ -1,0 +1,75 @@
+name: NyaTerm branch
+
+# Upstream's build.yml only triggers on `main`, so nothing runs on this branch.
+# This is a separate file rather than an edit to build.yml so that rebasing the
+# patch series onto a newer upstream never conflicts over CI configuration.
+#
+# The hardening tests this runs used to execute as part of NyaTerm's own
+# `cargo test --workspace`, because vnc-rs was a path dependency inside that
+# workspace. NyaTerm now consumes this crate as a pinned git dependency, so this
+# branch is the only place they run.
+
+on:
+  push:
+    branches: ["nyaterm"]
+  pull_request:
+    branches: ["nyaterm"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # Debug and release both, because the hardening relies on checked
+      # arithmetic and bounds tests whose failure modes differ between the two:
+      # debug catches an arithmetic overflow by panicking, release wraps.
+      - name: Tests (debug)
+        run: cargo test --all-features
+
+      - name: Tests (release)
+        run: cargo test --release --all-features
+
+      - name: Doc tests
+        run: cargo test --doc --all-features
+
+  build:
+    name: build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-latest
+          - name: windows
+            os: windows-latest
+          - name: wasm32
+            os: ubuntu-latest
+            target: wasm32-unknown-unknown
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add target
+        if: matrix.target != ''
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --verbose ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+
+      - name: Build (all features)
+        run: cargo build --verbose --all-features ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
