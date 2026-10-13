@@ -153,7 +153,12 @@ impl VncInner {
 
             let Some(pf) = pixel_format.as_ref() else {
                 decoder_desktop.close();
-                output::report_error(VncError::WrongPixelFormat, &output_ch_tx, &mut decoding_stop_rx).await;
+                output::report_error(
+                    VncError::WrongPixelFormat,
+                    &output_ch_tx,
+                    &mut decoding_stop_rx,
+                )
+                .await;
                 return;
             };
             let result = asycn_vnc_read_loop(
@@ -296,6 +301,7 @@ impl Drop for VncInner {
 
 pub struct VncClient {
     server_name: Arc<str>,
+    limits: VncLimits,
     inner: Arc<Mutex<VncInner>>,
     desktop: Arc<DesktopState>,
     input_ch: Sender<ClientMsg>,
@@ -315,6 +321,7 @@ impl VncClient {
         let inner = VncInner::new(stream, shared, pixel_format, encodings, limits).await?;
         Ok(Self {
             server_name: Arc::from(inner.name.as_str()),
+            limits,
             desktop: Arc::clone(&inner.desktop),
             input_ch: inner.input_ch.clone(),
             inner: Arc::new(Mutex::new(inner)),
@@ -344,6 +351,8 @@ impl VncClient {
         width: u16,
         height: u16,
     ) -> Result<crate::DesktopLayout, crate::ResizeError> {
+        validate_framebuffer(width, height, &self.limits)
+            .map_err(|_| crate::ResizeError::InvalidDimensions)?;
         self.desktop.request(&self.input_ch, width, height).await
     }
 
@@ -388,6 +397,7 @@ impl Clone for VncClient {
     fn clone(&self) -> Self {
         Self {
             server_name: Arc::clone(&self.server_name),
+            limits: self.limits,
             inner: self.inner.clone(),
             desktop: Arc::clone(&self.desktop),
             input_ch: self.input_ch.clone(),
@@ -509,6 +519,8 @@ where
     Ok(())
 }
 
+// Keep cancellation outside the decoder while sharing its connection state.
+#[allow(clippy::too_many_arguments)]
 async fn asycn_vnc_read_loop<S, F, Fut>(
     stream: &mut S,
     pf: &PixelFormat,
@@ -558,11 +570,24 @@ where
         trace!("Server message got: {:?}", server_msg);
         match server_msg {
             ServerMsg::FramebufferUpdate(rect_num) => {
-                ensure_limit("rectangles per update", usize::from(rect_num), usize::from(limits.max_rectangles_per_update))?;
+                if rect_num != u16::MAX || !encodings.contains(&VncEncoding::LastRectPseudo) {
+                    ensure_limit(
+                        "rectangles per update",
+                        usize::from(rect_num),
+                        usize::from(limits.max_rectangles_per_update),
+                    )?;
+                }
                 let mut updates = crate::desktop::UpdateBatch::default();
                 let mut framebuffer_changed = false;
-                for _ in 0..rect_num {
+                for index in 0..rect_num {
                     let rect = ImageRect::read(stream).await?;
+                    if rect.encoding != VncEncoding::LastRectPseudo {
+                        ensure_limit(
+                            "rectangles per update",
+                            usize::from(index) + 1,
+                            usize::from(limits.max_rectangles_per_update),
+                        )?;
+                    }
                     if rect.encoding != VncEncoding::Raw && !encodings.contains(&rect.encoding) {
                         return Err(VncError::InvalidImageData);
                     }
@@ -574,7 +599,7 @@ where
                             | VncEncoding::CursorPseudo
                     ) {
                         validate_rect(&rect.rect, limits)?;
-                        crate::limits::rectangle(&rect.rect, screen)?;
+                        crate::limits::rectangle(&rect.rect, screen, limits)?;
                     }
                     if !matches!(
                         rect.encoding,
@@ -600,7 +625,7 @@ where
                             let mut src_rect = rect.rect;
                             src_rect.x = source_x;
                             src_rect.y = source_y;
-                            crate::limits::rectangle(&src_rect, screen)?;
+                            crate::limits::rectangle(&src_rect, screen, limits)?;
                             output_func(VncEvent::Copy(rect.rect, src_rect)).await?;
                         }
                         VncEncoding::Tight => {
@@ -627,10 +652,12 @@ where
                             if framebuffer_changed {
                                 return Err(VncError::InvalidImageData);
                             }
-                            updates.push(crate::DesktopUpdate::read(stream, rect.rect).await?)?;
+                            updates.push(
+                                crate::DesktopUpdate::read(stream, rect.rect, limits).await?,
+                            )?;
                         }
                         VncEncoding::DesktopSizePseudo => {
-                            crate::limits::dimensions(rect.rect.width, rect.rect.height)?;
+                            validate_framebuffer(rect.rect.width, rect.rect.height, limits)?;
                             if rect.rect.x != 0 || rect.rect.y != 0 {
                                 return Err(VncError::InvalidImageData);
                             }

@@ -12,9 +12,18 @@ async fn decoder_error_releases_network_before_output_drains() {
         .await
         .unwrap();
     server.write_u32(0).await.unwrap();
-    let client = VncClient::new(stream, true, None, vec![VncEncoding::Raw])
-        .await
-        .unwrap();
+    let client = VncClient::new(
+        stream,
+        true,
+        None,
+        vec![VncEncoding::Raw],
+        VncLimits {
+            channel_capacity: 2,
+            ..VncLimits::default()
+        },
+    )
+    .await
+    .unwrap();
     // ClientInit, SetEncodings and the initial FramebufferUpdateRequest.
     tokio::time::timeout(Duration::from_secs(1), server.read_exact(&mut [0; 19]))
         .await
@@ -22,7 +31,7 @@ async fn decoder_error_releases_network_before_output_drains() {
         .unwrap();
     {
         let inner = client.inner.lock().await;
-        assert_eq!(inner.input_ch.max_capacity(), 4096);
+        assert_eq!(inner.input_ch.max_capacity(), 2);
         assert_eq!(inner.output_ch.max_capacity(), 2);
         assert_eq!(inner.output_ch.len(), 2);
     }

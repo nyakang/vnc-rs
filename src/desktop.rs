@@ -1,5 +1,8 @@
 //! Negotiated desktop layout and resize results. Geometry is always server-confirmed.
-use crate::{limits::dimensions, Rect, VncError};
+use crate::{
+    limits::{dimensions, dimensions_with_limits},
+    Rect, VncError, VncLimits,
+};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +134,7 @@ impl DesktopUpdate {
     pub(crate) async fn read<S: AsyncRead + Unpin>(
         reader: &mut S,
         rect: Rect,
+        limits: &VncLimits,
     ) -> Result<Self, VncError> {
         let count = reader.read_u8().await?;
         let mut padding = [0; 3];
@@ -170,6 +174,7 @@ impl DesktopUpdate {
                 height: rect.height,
                 screens,
             };
+            dimensions_with_limits(layout.width, layout.height, limits)?;
             layout.validate()?;
             Some(layout)
         } else {

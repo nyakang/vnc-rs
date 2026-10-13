@@ -41,8 +41,18 @@ fn single(reason: u16, status: u16, width: u16, height: u16) -> Vec<u8> {
     )
 }
 async fn extended(stream: tokio::io::DuplexStream) -> VncClient {
+    extended_with_limit(stream, u16::MAX).await
+}
+
+async fn extended_with_limit(stream: tokio::io::DuplexStream, limit: u16) -> VncClient {
     crate::VncConnector::new(stream)
         .set_auth_method(async { Ok(String::new()) })
+        .set_security_policy(crate::VncSecurityPolicy::NoneOnly)
+        .set_limits(VncLimits {
+            max_rectangles_per_update: limit,
+            max_framebuffer_pixels: 8_294_400,
+            ..VncLimits::default()
+        })
         .set_pixel_format(PixelFormat::rgba())
         .add_encoding(VncEncoding::Raw)
         .add_encoding(VncEncoding::DesktopSizePseudo)
@@ -188,6 +198,7 @@ async fn malformed_layouts_fail_but_unknown_reason_is_not_a_client_ack() {
             width: 80,
             height: 60,
         },
+        &VncLimits::default(),
     )
     .await
     .unwrap();
@@ -379,10 +390,32 @@ async fn last_rect_sentinel_bounds_actual_layouts_not_declared_count() {
         let mut b = [0];
         let _ = server.read(&mut b).await;
     });
-    let client = extended(stream).await;
+    let client = extended_with_limit(stream, 16).await;
     event(&client).await;
     assert!(matches!(event(&client).await, VncEvent::DesktopUpdate(_)));
     assert_eq!(client.desktop_layout().unwrap().width, 80);
+    client.close().await.unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn last_rect_sentinel_cannot_bypass_the_actual_rectangle_limit() {
+    let (stream, mut server) = duplex(4096);
+    let task = tokio::spawn(async move {
+        handshake(&mut server, (80, 60)).await;
+        let mut packet = single(0, 0, 80, 60);
+        packet[2..4].copy_from_slice(&u16::MAX.to_be_bytes());
+        let rectangle = single(0, 0, 80, 60);
+        for _ in 1..17 {
+            packet.extend(&rectangle[4..]);
+        }
+        server.write_all(&packet).await.unwrap();
+        let mut b = [0];
+        let _ = server.read(&mut b).await;
+    });
+    let client = extended_with_limit(stream, 16).await;
+    event(&client).await;
+    assert!(matches!(event(&client).await, VncEvent::Error(_)));
     client.close().await.unwrap();
     task.await.unwrap();
 }
@@ -425,6 +458,7 @@ pub(super) async fn handshake_named(server: &mut DuplexStream, size: (u16, u16),
 pub(super) async fn connect(stream: DuplexStream) -> VncClient {
     VncConnector::new(stream)
         .set_auth_method(async { Ok("test".to_string()) })
+        .set_security_policy(crate::VncSecurityPolicy::NoneOnly)
         .set_pixel_format(PixelFormat::rgba())
         .add_encoding(VncEncoding::Raw)
         .add_encoding(VncEncoding::CopyRect)

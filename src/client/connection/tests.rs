@@ -1,3 +1,7 @@
+const OUTPUT_CHANNEL_SIZE: usize = 2;
+const INPUT_CHANNEL_SIZE: usize = 4096;
+const NETWORK_CHANNEL_SIZE: usize = 4096;
+
 use super::*;
 use std::time::Duration;
 use tokio::io::duplex;
@@ -29,9 +33,12 @@ async fn oversized_initialization_is_rejected_before_payload_reads() {
         server.write_u32(length).await.unwrap();
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            read_server_init(&mut client, &mut Some(PixelFormat::rgba()), &|_| async {
-                Ok(())
-            }),
+            read_server_init(
+                &mut client,
+                &mut Some(PixelFormat::rgba()),
+                &upstream_limits(),
+                &|_| async { Ok(()) },
+            ),
         )
         .await
         .unwrap();
@@ -84,6 +91,7 @@ async fn invalid_rectangles_and_lengths_are_rejected_before_payload_reads() {
             asycn_vnc_read_loop(
                 &mut client,
                 &PixelFormat::rgba(),
+                &upstream_limits(),
                 &|_| async { Ok(()) },
                 &mut stopped,
                 &[
@@ -128,6 +136,7 @@ async fn raw_is_implicit_and_resize_changes_decoder_bounds() {
     let result = asycn_vnc_read_loop(
         &mut bytes.as_slice(),
         &PixelFormat::rgba(),
+        &upstream_limits(),
         &|event| {
             output.lock().unwrap().push(event);
             async { Ok(()) }
@@ -171,9 +180,11 @@ async fn shutdown_interrupts_a_full_event_queue() {
     };
     let screen = AtomicU32::new(pack_screen((1, 1)));
     let desktop = DesktopState::default();
+    let limits = upstream_limits();
     let task = asycn_vnc_read_loop(
         &mut input,
         &format,
+        &limits,
         &deliver,
         &mut stopped,
         &[],
@@ -281,11 +292,13 @@ async fn full_input_queue_does_not_hold_the_client_lock_during_close() {
     let (decoder_stop, decoder_stopped) = oneshot::channel();
     let desktop = Arc::new(DesktopState::default());
     let client = VncClient {
+        limits: VncLimits::default(),
         server_name: Arc::from(""),
         desktop: Arc::clone(&desktop),
         input_ch: input_ch.clone(),
         inner: Arc::new(Mutex::new(VncInner {
             name: String::new(),
+            limits: VncLimits::default(),
             screen: Arc::new(AtomicU32::new(pack_screen((1, 1)))),
             desktop,
             input_ch,
@@ -324,5 +337,16 @@ async fn server_name_survives_close_and_clone() {
         let clone = client.clone();
         client.close().await.unwrap();
         assert_eq!(clone.server_name(), name);
+    }
+}
+
+fn upstream_limits() -> VncLimits {
+    VncLimits {
+        max_framebuffer_width: 8192,
+        max_framebuffer_height: 8192,
+        max_framebuffer_pixels: 8_294_400,
+        max_server_name_bytes: 4096,
+        max_clipboard_bytes: 1024 * 1024,
+        ..VncLimits::default()
     }
 }
