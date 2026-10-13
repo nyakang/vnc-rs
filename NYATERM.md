@@ -141,3 +141,12 @@ Validation is on Windows; native macOS/Linux checks are delegated to the
 branch workflow. Interactive GUI/file-drop and real-server authentication
 checks were not performed by this update. Their outcomes must not be inferred
 from scripted peers or compile checks.
+
+### CI follow-up: browser randomness
+
+The first 2026-10-13 CI run failed only the wasm32 build: RA2's OsRng pulled
+getrandom 0.2 without a browser entropy provider. Enable its js feature only
+for wasm32, using Web Crypto and leaving native RNG selection unchanged.
+Windows-hosted wasm32-unknown-unknown all-feature build, native strict clippy
+and fmt pass. Debug/release tests passed before this target-only dependency
+change. The follow-up branch CI verifies Linux/Windows/WASM and all regressions.

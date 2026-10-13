@@ -47,6 +47,8 @@ tokio = { version = "^1", features = ["sync", "macros", "io-util", "rt", "rt-mul
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-futures = "0.4"
+# RA2 uses OsRng; browser builds must use Web Crypto rather than a native source.
+getrandom = { version = "0.2", features = ["js"] }
 tokio = { version = "^1", features = [
     "sync",
     "macros",
