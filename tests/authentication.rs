@@ -1,6 +1,6 @@
 use std::time::Duration;
 use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
-use vnc::{VncConnector, VncEncoding, VncError, VncVersion};
+use vnc::{VncConnector, VncEncoding, VncError, VncSecurityPolicy, VncVersion};
 
 #[tokio::test]
 async fn failures_finish_without_waiting_for_server_eof() {
@@ -33,6 +33,11 @@ async fn failures_finish_without_waiting_for_server_eof() {
                     Duration::from_secs(1),
                     VncConnector::new(client)
                         .set_auth_method(async { Ok("test".into()) })
+                        .set_security_policy(if password {
+                            VncSecurityPolicy::VncAuthOnly
+                        } else {
+                            VncSecurityPolicy::NoneOnly
+                        })
                         .set_version(version)
                         .add_encoding(VncEncoding::Raw)
                         .build()
@@ -43,8 +48,10 @@ async fn failures_finish_without_waiting_for_server_eof() {
                 .expect("authentication waited for EOF");
                 if status == 1 && version != VncVersion::RFB38 {
                     assert!(matches!(result, Err(VncError::WrongPassword)));
+                } else if status == 1 {
+                    assert!(matches!(result, Err(VncError::SecurityFailure(_))));
                 } else {
-                    assert!(matches!(result, Err(VncError::General(_))));
+                    assert!(matches!(result, Err(VncError::InvalidSecurityResult(_))));
                 }
                 // No ClientInit byte may be sent after authentication fails.
                 let mut sent = Vec::new();

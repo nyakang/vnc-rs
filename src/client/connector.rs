@@ -153,7 +153,7 @@ where
                             auth.write(&mut connector.stream).await?;
                             let result = auth.finish(&mut connector.stream).await?;
                             if let AuthResult::Failed = result {
-                                if let VncVersion::RFB37 = connector.rfb_version {
+                                if connector.rfb_version != VncVersion::RFB38 {
                                     return Err(VncError::WrongPassword);
                                 }
                                 let reason =
