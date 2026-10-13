@@ -219,7 +219,7 @@ pub use desktop::*;
 pub mod limits;
 
 pub use client::VncClient;
-pub use client::VncConnector;
+pub use client::{VncConnector, VncSecurityPolicy, VncServerKey};
 pub use config::*;
 pub use error::*;
 pub use event::*;

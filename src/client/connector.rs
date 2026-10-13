@@ -9,7 +9,14 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tracing::{info, trace};
 
-use crate::{PixelFormat, VncEncoding, VncError, VncVersion};
+use crate::{PixelFormat, VncEncoding, VncError, VncLimits, VncVersion};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VncSecurityPolicy {
+    Auto,
+    NoneOnly,
+    VncAuthOnly,
+}
 
 pub enum VncState<S, F>
 where
@@ -52,26 +59,23 @@ where
                     Ok(VncState::Authenticate(connector).try_start().await?)
                 }
                 VncState::Authenticate(mut connector) => {
-                    let security_types =
-                        SecurityType::read(&mut connector.stream, &connector.rfb_version).await?;
+                    let security_types = SecurityType::read(
+                        &mut connector.stream,
+                        &connector.rfb_version,
+                        &connector.limits,
+                    )
+                    .await?;
 
-                    assert!(!security_types.is_empty());
-
-                    if security_types.contains(&SecurityType::None) {
-                        match connector.rfb_version {
-                            VncVersion::RFB33 => {
-                                // If the security-type is 1, for no authentication, the server does not
-                                // send the SecurityResult message but proceeds directly to the
-                                // initialization messages (Section 7.3).
-                                info!("No auth needed in vnc3.3");
+                    let selected = match connector.security_policy {
+                        VncSecurityPolicy::NoneOnly => {
+                            if !security_types.contains(&SecurityType::None) {
+                                return Err(VncError::RequiredSecurityTypeUnavailable("none"));
                             }
-                            VncVersion::RFB37 => {
-                                // After the security handshake, if the security-type is 1, for no
-                                // authentication, the server does not send the SecurityResult message
-                                // but proceeds directly to the initialization messages (Section 7.3).
-                                info!("No auth needed in vnc3.7");
-                                SecurityType::write(&SecurityType::None, &mut connector.stream)
-                                    .await?;
+                            SecurityType::None
+                        }
+                        VncSecurityPolicy::VncAuthOnly => {
+                            if !security_types.contains(&SecurityType::VncAuth) {
+                                return Err(VncError::RequiredSecurityTypeUnavailable("vnc-auth"));
                             }
                             SecurityType::VncAuth
                         }
@@ -86,25 +90,11 @@ where
                                 return Err(VncError::UnsupportedSecurityType);
                             }
                         }
-                    } else {
-                        // choose a auth method
-                        if security_types.contains(&SecurityType::VncAuth) {
-                            if connector.rfb_version != VncVersion::RFB33 {
-                                // In the security handshake (Section 7.1.2), rather than a two-way
-                                // negotiation, the server decides the security type and sends a single
-                                // word:
-
-                                //            +--------------+--------------+---------------+
-                                //            | No. of bytes | Type [Value] | Description   |
-                                //            +--------------+--------------+---------------+
-                                //            | 4            | U32          | security-type |
-                                //            +--------------+--------------+---------------+
-
-                                // The security-type may only take the value 0, 1, or 2.  A value of 0
-                                // means that the connection has failed and is followed by a string
-                                // giving the reason, as described in Section 7.1.2.
-                                SecurityType::write(&SecurityType::VncAuth, &mut connector.stream)
-                                    .await?;
+                        VncSecurityPolicy::Auto => {
+                            if security_types.contains(&SecurityType::None) {
+                                SecurityType::None
+                            } else {
+                                return Err(VncError::UnsupportedSecurityType);
                             }
                         }
                     };
@@ -242,6 +232,11 @@ where
 {
     stream: S,
     auth_methond: Option<F>,
+    credentials_available: bool,
+    username: Option<String>,
+    server_key_verifier: Option<ServerKeyVerifier>,
+    server_key_authenticated: Option<Arc<dyn Fn(VncServerKey) + Send + Sync>>,
+    security_policy: VncSecurityPolicy,
     rfb_version: VncVersion,
     allow_shared: bool,
     pixel_format: Option<PixelFormat>,
@@ -285,6 +280,11 @@ where
         Self {
             stream,
             auth_methond: None,
+            credentials_available: false,
+            username: None,
+            server_key_verifier: None,
+            server_key_authenticated: None,
+            security_policy: VncSecurityPolicy::Auto,
             allow_shared: true,
             rfb_version: VncVersion::RFB38,
             pixel_format: None,
@@ -334,6 +334,43 @@ where
     ///
     pub fn set_auth_method(mut self, auth_callback: F) -> Self {
         self.auth_methond = Some(auth_callback);
+        self.credentials_available = true;
+        self
+    }
+
+    pub fn set_credentials_available(mut self, available: bool) -> Self {
+        self.credentials_available = available;
+        self
+    }
+
+    pub fn set_username(mut self, username: impl Into<String>) -> Self {
+        self.username = Some(username.into());
+        self
+    }
+
+    pub fn set_server_key_verifier<V, Fut>(mut self, verifier: V) -> Self
+    where
+        V: Fn(VncServerKey) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), VncError>> + Send + 'static,
+    {
+        self.server_key_verifier = Some(Arc::new(move |key| Box::pin(verifier(key))));
+        self
+    }
+
+    /// Notify the application after server-key confirmation, authenticated
+    /// ServerHash, SecurityResult, and RFB initialization have all succeeded.
+    /// This callback has no storage policy; applications must still guard
+    /// cancellation and connection ownership before committing trust.
+    pub fn set_server_key_authenticated<V>(mut self, notify: V) -> Self
+    where
+        V: Fn(VncServerKey) + Send + Sync + 'static,
+    {
+        self.server_key_authenticated = Some(Arc::new(notify));
+        self
+    }
+
+    pub fn set_security_policy(mut self, policy: VncSecurityPolicy) -> Self {
+        self.security_policy = policy;
         self
     }
 
