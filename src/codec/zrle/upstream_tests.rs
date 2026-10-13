@@ -26,7 +26,7 @@ async fn malformed_palette_index_and_runs_return_errors() {
         let mut compressor = flate2::Compress::new(flate2::Compression::fast(), true);
         let packet = compress(&mut compressor, &data);
         let mut input = packet.as_slice();
-        let result = Decoder::new()
+        let result = Decoder::new(crate::VncLimits::default())
             .decode(
                 &PixelFormat::rgba(),
                 &Rect {
@@ -46,7 +46,7 @@ async fn malformed_palette_index_and_runs_return_errors() {
 #[tokio::test]
 async fn valid_modes_and_persistent_compression_preserve_pixels() {
     let mut compressor = flate2::Compress::new(flate2::Compression::fast(), true);
-    let mut decoder = Decoder::new();
+    let mut decoder = Decoder::new(crate::VncLimits::default());
     // Raw, solid, packed-palette, plain RLE and palette RLE for a two-pixel tile.
     for (data, expected) in [
         (vec![0, 1, 2, 3, 4, 5, 6], vec![1, 2, 3, 255, 4, 5, 6, 255]),

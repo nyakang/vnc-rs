@@ -432,8 +432,10 @@ mod tests {
         let payload = raw_payload(&events);
         assert_eq!(payload.len(), 66 * 4);
         assert!(payload[..64 * 4]
-            .chunks_exact(4)
-            .all(|pixel| pixel == [7, 8, 9, 255]));
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| *pixel == [7, 8, 9, 255]));
         assert_eq!(
             &payload[64 * 4..66 * 4],
             &[40, 50, 60, 255, 40, 50, 60, 255]

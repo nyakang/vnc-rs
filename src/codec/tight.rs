@@ -50,6 +50,12 @@ impl Decoder {
         Fut: Future<Output = Result<(), VncError>>,
     {
         format.validate()?;
+        if format.bits_per_pixel != 32
+            || format.true_color_flag == 0
+            || [format.red_max, format.green_max, format.blue_max] != [255; 3]
+        {
+            return Err(VncError::WrongPixelFormat);
+        }
         self.alpha_shift = alpha_shift(format)?;
 
         let ctrl = input.read_u8().await?;
@@ -268,6 +274,9 @@ impl Decoder {
         Fut: Future<Output = Result<(), VncError>>,
     {
         let num_colors = input.read_u8().await? as usize + 1;
+        if num_colors < 2 {
+            return Err(VncError::InvalidImageData);
+        }
         let palette_size = num_colors
             .checked_mul(3)
             .ok_or(VncError::IntegerOverflow("tight palette size"))?;

@@ -23,7 +23,7 @@ async fn tight_fill_copy_and_palette_modes_preserve_pixels() {
         ),
     ] {
         let output = Mutex::new(Vec::new());
-        TightDecoder::new()
+        TightDecoder::new(crate::VncLimits::default())
             .decode(
                 &PixelFormat::rgba(),
                 &rect,
@@ -53,7 +53,7 @@ async fn tight_rejects_invalid_palette_indexes_and_unsupported_formats() {
         vec![0x40, 1, 0], // a single color must use Fill
         vec![0x40, 1, 2, 1, 2, 3, 4, 5, 6, 7, 8, 9, 3, 0],
     ] {
-        let result = TightDecoder::new()
+        let result = TightDecoder::new(crate::VncLimits::default())
             .decode(
                 &PixelFormat::rgba(),
                 &rect,
@@ -66,7 +66,7 @@ async fn tight_rejects_invalid_palette_indexes_and_unsupported_formats() {
     let mut format = PixelFormat::rgba();
     format.true_color_flag = 0;
     format.red_shift = 255; // ignored for indexed color, must never be shifted
-    let result = TightDecoder::new()
+    let result = TightDecoder::new(crate::VncLimits::default())
         .decode(&format, &rect, &mut &[][..], &|_| async { Ok(()) })
         .await;
     assert!(matches!(result, Err(VncError::WrongPixelFormat)));
@@ -80,7 +80,7 @@ async fn cursor_preserves_alpha_mask_and_accepts_empty_shapes() {
         (0, vec![], vec![]),
     ] {
         let output = Mutex::new(Vec::new());
-        CursorDecoder::new()
+        CursorDecoder::new(crate::VncLimits::default())
             .decode(
                 &PixelFormat::rgba(),
                 &Rect {
@@ -113,7 +113,7 @@ async fn tight_rejects_component_widths_its_filters_cannot_decode() {
     format.blue_max = 1;
     format.blue_shift = 23;
     assert!(format.validate().is_ok());
-    let result = TightDecoder::new()
+    let result = TightDecoder::new(crate::VncLimits::default())
         .decode(
             &format,
             &Rect {
