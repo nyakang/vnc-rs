@@ -93,6 +93,13 @@ where
                         VncSecurityPolicy::Auto => {
                             if security_types.contains(&SecurityType::None) {
                                 SecurityType::None
+                            } else if security_types.contains(&SecurityType::VncAuth)
+                                || (connector.rfb_version != VncVersion::RFB33
+                                    && security_types.contains(&SecurityType::RA2_256))
+                            {
+                                // A supported authenticated mode exists, but Auto cannot
+                                // select it until the caller supplies credentials.
+                                return Err(VncError::NoPassword);
                             } else {
                                 return Err(VncError::UnsupportedSecurityType);
                             }
@@ -892,6 +899,45 @@ mod tests {
                 !notified.load(std::sync::atomic::Ordering::SeqCst),
                 "{outcome}"
             );
+            server_task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_without_credentials_distinguishes_missing_password_from_unsupported_security() {
+        for (version, security_type, missing) in [
+            (VncVersion::RFB33, 2, true),
+            (VncVersion::RFB37, 2, true),
+            (VncVersion::RFB38, 2, true),
+            (VncVersion::RFB38, 129, true),
+            (VncVersion::RFB38, 16, false),
+        ] {
+            let (client, mut server) = tokio::io::duplex(128);
+            let server_task = tokio::spawn(async move {
+                version.write(&mut server).await.unwrap();
+                server.read_exact(&mut [0; 12]).await.unwrap();
+                if version == VncVersion::RFB33 {
+                    server.write_u32(u32::from(security_type)).await.unwrap();
+                } else {
+                    server.write_all(&[1, security_type]).await.unwrap();
+                }
+                // No security choice or credentials should be sent before returning.
+                assert_eq!(server.read(&mut [0]).await.unwrap(), 0);
+            });
+            let result = VncConnector::new(client)
+                .set_auth_method(async { Ok(String::new()) })
+                .set_credentials_available(false)
+                .set_security_policy(VncSecurityPolicy::Auto)
+                .add_encoding(VncEncoding::Raw)
+                .build()
+                .unwrap()
+                .try_start()
+                .await;
+            if missing {
+                assert!(matches!(result, Err(VncError::NoPassword)));
+            } else {
+                assert!(matches!(result, Err(VncError::UnsupportedSecurityType)));
+            }
             server_task.await.unwrap();
         }
     }

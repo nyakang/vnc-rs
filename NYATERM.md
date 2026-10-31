@@ -150,3 +150,19 @@ for wasm32, using Web Crypto and leaving native RNG selection unchanged.
 Windows-hosted wasm32-unknown-unknown all-feature build, native strict clippy
 and fmt pass. Debug/release tests passed before this target-only dependency
 change. The follow-up branch CI verifies Linux/Windows/WASM and all regressions.
+
+## Passwordless Auto authentication classification (2026-10-31)
+
+`Auto` without credentials still selects `None` when the server offers it.
+When only supported authenticated types (classic VNC or RA2_256) are offered,
+return `NoPassword` before sending a security selection, instead of conflating
+missing credentials with `UnsupportedSecurityType`. Unsupported offerings and
+explicit security policies keep their existing fail-closed errors. This lets
+NyaTerm PR #1047 request a password only when credentials can resolve the failure,
+without treating rejected server keys or incompatible security as missing input.
+
+Scripted handshake regressions cover RFB 3.3/3.7/3.8 classic VNC, RA2_256 and an
+unsupported security type, including the absence of outgoing authentication bytes.
+Windows validation: `cargo test --all-features` (77 unit tests, 1 authentication
+integration test, 2 doctests), `cargo fmt --all -- --check`, and
+`cargo clippy --all-targets --all-features -- -D warnings` passed.
